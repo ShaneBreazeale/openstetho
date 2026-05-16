@@ -1,0 +1,37 @@
+[project]
+name = "openstetho-model"
+version = "0.1.0"
+description = "Murmur detector training pipeline (PyTorch + Core ML)"
+requires-python = ">=3.11,<3.13"
+# Pinned to keep coremltools export compatible. coremltools 9.x has only
+# been tested through torch 2.7; newer torch versions sometimes export
+# but may emit silent op rewrites that change ANE compatibility.
+dependencies = [
+    "torch>=2.7,<2.8",
+    "torchaudio>=2.7,<2.8",
+    "coremltools>=8.0",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "numpy>=1.26,<3.0",
+    "scikit-learn>=1.4,<1.6",
+    "pandas>=2.1",
+    "tqdm>=4.66",
+    "matplotlib>=3.8",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["openstetho_model"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

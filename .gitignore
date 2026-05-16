@@ -1,0 +1,49 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+uv.lock
+
+# ML artefacts — never commit; rebuild from training command
+dist/
+runs/
+*.pt
+*.mlpackage/
+*.mlmodelc/
+*.onnx
+
+# Public datasets — link to source, don't redistribute
+data/
+
+# Local-only research artefacts
+apk/
+unpacked/
+jadx-out/
+natives/
+models/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# AI tooling — keep local, don't ship
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursor/
+.cursorrules
+.cursorignore
+.aider*
+.codex/
+.windsurfrules
+.continue/
+.github/copilot-instructions.md

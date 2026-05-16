@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "stetho-core",
+    "stetho-cli",
+    "stetho-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# BLE
+btleplug = "0.11"
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# FFT for mel-spec
+rustfft = "6"
+# WAV I/O
+hound = "3"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Errors
+thiserror = "1"
+anyhow = "1"
+# Numeric helpers
+num-complex = "0.4"
+# Bytes
+bytes = "1"
+# UUIDs
+uuid = "1"
+# GUI
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.29"
+egui_plot = "0.29"
+crossbeam-channel = "0.5"
+# Tests
+approx = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

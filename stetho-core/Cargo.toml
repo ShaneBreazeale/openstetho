@@ -1,0 +1,23 @@
+[package]
+name = "stetho-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BLE protocol + DSP core for digital stethoscope interoperability research"
+
+[dependencies]
+btleplug.workspace = true
+tokio.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+num-complex.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+futures = "0.3"
+
+[dev-dependencies]
+approx.workspace = true
+hound.workspace = true
+tracing-subscriber.workspace = true
