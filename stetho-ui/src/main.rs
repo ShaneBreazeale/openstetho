@@ -11,7 +11,7 @@ mod inference;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use inference::MurmurEngine;
+use inference::{MurmurEngine, S3Engine, N_FRAMES_MURMUR, N_FRAMES_S3};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -47,6 +47,7 @@ enum Msg {
     Samples(Vec<i16>),
     MelFrame([f32; N_MELS]),
     MurmurProb(f32),
+    S3Prob(f32),
     ModelDownloadFinished(Result<PathBuf, String>),
 }
 
@@ -82,6 +83,8 @@ struct App {
     show_spec: bool,
     murmur_prob: Option<f32>,
     murmur_history: Vec<f32>,
+    s3_prob: Option<f32>,
+    s3_history: Vec<f32>,
     model_path: Option<PathBuf>,
     available_models: Vec<PathBuf>,
     model_download_busy: bool,
@@ -110,6 +113,8 @@ impl App {
             show_spec: true,
             murmur_prob: None,
             murmur_history: Vec::with_capacity(60),
+            s3_prob: None,
+            s3_history: Vec::with_capacity(60),
             model_path,
             available_models,
             model_download_busy: false,
@@ -150,6 +155,13 @@ impl App {
                     }
                     self.murmur_history.push(p);
                 }
+                Ok(Msg::S3Prob(p)) => {
+                    self.s3_prob = Some(p);
+                    if self.s3_history.len() == 60 {
+                        self.s3_history.remove(0);
+                    }
+                    self.s3_history.push(p);
+                }
                 Ok(Msg::ModelDownloadFinished(result)) => {
                     self.model_download_busy = false;
                     match result {
@@ -163,6 +175,8 @@ impl App {
                             self.model_path = Some(path.clone());
                             self.murmur_prob = None;
                             self.murmur_history.clear();
+                            self.s3_prob = None;
+                            self.s3_history.clear();
                             let _ = self.cmd_tx.send(Cmd::SetModel(path));
                         }
                         Err(err) => {
@@ -223,6 +237,21 @@ impl eframe::App for App {
                     };
                     ui.colored_label(color, format!("murmur: {:.0}%", p * 100.0));
                 }
+                if let Some(p) = self.s3_prob {
+                    ui.separator();
+                    // S3 is calibrated against synthetic injection; on real
+                    // audio the meaningful operating window is roughly
+                    // 0.93 (high sensitivity) to 0.99 (high specificity)
+                    // per docs/real_validation_results.md. Color tracks that.
+                    let color = if p > 0.93 {
+                        egui::Color32::from_rgb(220, 60, 60)
+                    } else if p > 0.5 {
+                        egui::Color32::from_rgb(220, 180, 60)
+                    } else {
+                        egui::Color32::from_rgb(80, 180, 80)
+                    };
+                    ui.colored_label(color, format!("S3: {:.0}%", p * 100.0));
+                }
                 if !self.available_models.is_empty() {
                     ui.separator();
                     ui.label("model");
@@ -249,6 +278,8 @@ impl eframe::App for App {
                             self.model_path = Some(p.clone());
                             self.murmur_prob = None;
                             self.murmur_history.clear();
+                            self.s3_prob = None;
+                            self.s3_history.clear();
                             let _ = self.cmd_tx.send(Cmd::SetModel(p));
                         }
                     }
@@ -602,7 +633,7 @@ async fn stream_session(
     // mid-stream (signalled via cfg.model_dirty).
     let load_current_model = |path: Option<&PathBuf>| -> Option<MurmurEngine> {
         match path {
-            Some(p) => match MurmurEngine::load(p) {
+            Some(p) => match MurmurEngine::load(p, N_FRAMES_MURMUR) {
                 Ok(e) => {
                     let _ = tx.send(Msg::Status(format!("model loaded: {}", p.display())));
                     Some(e)
@@ -616,12 +647,40 @@ async fn stream_session(
         }
     };
 
-    let mut engine: Option<MurmurEngine> = {
+    // S3 model is opportunistic — we look in the same directory as the
+    // murmur model for an `S3CNN_v2.mlpackage` sibling and load it if
+    // present. Absent that file the UI runs murmur-only as before.
+    let load_s3_model = |murmur_path: Option<&PathBuf>| -> Option<(S3Engine, PathBuf)> {
+        let p = murmur_path?;
+        let dir = p.parent()?;
+        for candidate_name in ["S3CNN_v2.mlpackage", "S3CNN.mlpackage"] {
+            let candidate = dir.join(candidate_name);
+            if !candidate.exists() {
+                continue;
+            }
+            return match S3Engine::load(&candidate, N_FRAMES_S3) {
+                Ok(e) => {
+                    let _ = tx.send(Msg::Status(format!("S3 model loaded: {}", candidate.display())));
+                    Some((e, candidate))
+                }
+                Err(err) => {
+                    let _ = tx.send(Msg::Status(format!("S3 model load failed: {err}")));
+                    None
+                }
+            };
+        }
+        None
+    };
+
+    let initial_murmur_path = {
         let p = cfg.model_path.lock().unwrap().clone();
         cfg.model_dirty
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        load_current_model(p.as_ref())
+        p
     };
+    let mut engine: Option<MurmurEngine> = load_current_model(initial_murmur_path.as_ref());
+    let mut s3_engine_pair: Option<(S3Engine, PathBuf)> =
+        load_s3_model(initial_murmur_path.as_ref());
 
     loop {
         tokio::select! {
@@ -639,6 +698,7 @@ async fn stream_session(
                 if cfg.model_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     let path = cfg.model_path.lock().unwrap().clone();
                     engine = load_current_model(path.as_ref());
+                    s3_engine_pair = load_s3_model(path.as_ref());
                 }
 
                 // Refresh EQ chain on preset change.
@@ -690,6 +750,11 @@ async fn stream_session(
                     if let Some(eng) = engine.as_mut() {
                         if let Some(prob) = eng.push_frame(&norm_frame) {
                             let _ = tx.send(Msg::MurmurProb(prob));
+                        }
+                    }
+                    if let Some((eng, _)) = s3_engine_pair.as_mut() {
+                        if let Some(prob) = eng.push_frame(&norm_frame) {
+                            let _ = tx.send(Msg::S3Prob(prob));
                         }
                     }
                 }

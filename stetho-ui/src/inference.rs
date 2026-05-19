@@ -1,14 +1,31 @@
 //! Inference dispatch.
 //!
-//! Loads a Core ML `.mlpackage` mel-spec classifier and accumulates
-//! `N_FRAMES` mel frames before each prediction. Inputs:
-//! `(1, 1, N_FRAMES, N_MELS)` f32. Output: a single sigmoid logit.
+//! Loads a Core ML `.mlpackage` mel-spec classifier and accumulates a
+//! configurable number of mel frames before each prediction. Inputs:
+//! `(1, 1, n_frames, N_MELS)` f32. Output: a single sigmoid logit.
+//!
+//! The runtime hosts two engines in parallel:
+//!
+//! * `MurmurEngine` — `N_FRAMES_MURMUR = 62` frames per window (4 s @
+//!   hop 256 / 4 kHz). Matches `MurmurCNN`'s training shape.
+//! * `S3Engine` — `N_FRAMES_S3 = 23` frames per window (1.5 s S2-anchored
+//!   crop). Matches `S3CNN_v2`'s training shape.
+//!
+//! Both engines consume the *same* z-scored mel frame stream produced by
+//! `LogMelSpectrogram::process_with_display`. Each one buffers
+//! independently and emits a probability whenever its window is full.
 
 use std::path::Path;
 use stetho_core::dsp::mel::N_MELS;
 use tracing::{info, warn};
 
-pub const N_FRAMES: usize = 62;
+pub const N_FRAMES_MURMUR: usize = 62;
+pub const N_FRAMES_S3: usize = 23;
+
+/// Default for code that hasn't been updated to choose a window length —
+/// historically the murmur engine's frame count.
+#[allow(dead_code)]
+pub const N_FRAMES: usize = N_FRAMES_MURMUR;
 
 #[cfg(target_os = "macos")]
 mod ml {
@@ -20,10 +37,11 @@ mod ml {
         buf: Vec<f32>,
         input_name: String,
         output_name: String,
+        n_frames: usize,
     }
 
     impl MelEngine {
-        pub fn load(path: &Path) -> anyhow::Result<Self> {
+        pub fn load(path: &Path, n_frames: usize) -> anyhow::Result<Self> {
             let needs_compile = path
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("mlpackage") || e.eq_ignore_ascii_case("mlmodel"))
@@ -49,32 +67,42 @@ mod ml {
                 .map(|f| f.name().to_string())
                 .ok_or_else(|| anyhow::anyhow!("model has no output"))?;
             info!(
-                "loaded Core ML model {} — input '{}' output '{}'",
+                "loaded Core ML model {} ({} frames) — input '{}' output '{}'",
                 path.display(),
+                n_frames,
                 input_name,
                 output_name,
             );
             Ok(Self {
                 model,
-                buf: Vec::with_capacity(N_FRAMES * N_MELS),
+                buf: Vec::with_capacity(n_frames * N_MELS),
                 input_name,
                 output_name,
+                n_frames,
             })
+        }
+
+        #[allow(dead_code)]
+        pub fn n_frames(&self) -> usize {
+            self.n_frames
         }
 
         pub fn push_frame(&mut self, frame: &[f32; N_MELS]) -> Option<f32> {
             self.buf.extend_from_slice(frame);
-            if self.buf.len() < N_FRAMES * N_MELS {
+            if self.buf.len() < self.n_frames * N_MELS {
                 return None;
             }
             let prob = self.predict_window();
-            self.buf.drain(..(N_FRAMES * N_MELS / 2));
+            // 50 % overlap between successive windows so we get a fresh
+            // prediction every n_frames/2 hops without waiting for a full
+            // disjoint window.
+            self.buf.drain(..(self.n_frames * N_MELS / 2));
             prob
         }
 
         fn predict_window(&self) -> Option<f32> {
-            let shape = [1usize, 1, N_FRAMES, N_MELS];
-            let slice = &self.buf[..N_FRAMES * N_MELS];
+            let shape = [1usize, 1, self.n_frames, N_MELS];
+            let slice = &self.buf[..self.n_frames * N_MELS];
             let tensor = BorrowedTensor::from_f32(slice, &shape)
                 .map_err(|e| warn!("BorrowedTensor::from_f32: {e}"))
                 .ok()?;
@@ -101,15 +129,22 @@ mod ml {
 
 #[cfg(target_os = "macos")]
 pub use ml::Engine as MurmurEngine;
+#[cfg(target_os = "macos")]
+pub type S3Engine = ml::Engine;
 
 #[cfg(not(target_os = "macos"))]
 pub struct MurmurEngine;
 #[cfg(not(target_os = "macos"))]
 impl MurmurEngine {
-    pub fn load(_path: &Path) -> anyhow::Result<Self> {
+    pub fn load(_path: &Path, _n_frames: usize) -> anyhow::Result<Self> {
         anyhow::bail!("inference only available on macOS / iOS")
     }
     pub fn push_frame(&mut self, _frame: &[f32; N_MELS]) -> Option<f32> {
         None
     }
+    pub fn n_frames(&self) -> usize {
+        0
+    }
 }
+#[cfg(not(target_os = "macos"))]
+pub type S3Engine = MurmurEngine;
