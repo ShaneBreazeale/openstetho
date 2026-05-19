@@ -50,6 +50,21 @@ def apply_cardiac(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     return sps.sosfilt(cardiac_sos(sample_rate), x).astype(np.float32, copy=False)
 
 
+def s3_sos(sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Cascaded SOS for HP15 → LP120 Butterworth. Preserves S3 band (30–70 Hz)
+    while attenuating mains hum and above-cardiac noise. Use for the S3
+    detector path — `cardiac_sos` would attenuate ~20 dB at 40 Hz and erase
+    most of the gallop energy."""
+    hp15 = sps.butter(2, 15.0, btype="high", fs=sample_rate, output="sos")
+    lp120 = sps.butter(2, 120.0, btype="low", fs=sample_rate, output="sos")
+    return np.vstack([hp15, lp120])
+
+
+def apply_s3_preset(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Apply the S3-detector filter chain causally."""
+    return sps.sosfilt(s3_sos(sample_rate), x).astype(np.float32, copy=False)
+
+
 # ─── resample + load ────────────────────────────────────────────────────────
 
 def load_audio(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:

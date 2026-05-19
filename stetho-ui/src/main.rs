@@ -12,6 +12,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use inference::MurmurEngine;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -369,10 +370,56 @@ impl eframe::App for App {
     }
 }
 
-/// Map a z-scored mel value to an inferno-ish colormap (better contrast
-/// across the typical [-2, +2] z range we see after per-frame z-score).
+/// Number of past raw-dB frames retained for the display-side rolling
+/// normalization. At hop=256, sr=4 kHz that's 64 ms/frame → ~78 frames
+/// per 5 s of audio. Pick a window long enough to span at least one
+/// full cardiac cycle so S1 and S2 fall inside the same reference.
+const DB_HISTORY_FRAMES: usize = 80;
+
+/// Convert one raw dB mel frame into a display value in roughly [0, 1].
+///
+/// Design choices for you to make in the body:
+///   1. Rolling reference: max over `history`? max-per-bin? 95th
+///      percentile? Global EMA? Tradeoff: max is sharpest but spiky;
+///      percentile rejects outliers but costs a sort.
+///   2. Dynamic range: subtract reference, clip to `[-DR, 0]` dB, then
+///      remap to `[0, 1]`. Conventional `DR` = 60–80 dB. Smaller `DR`
+///      gives more contrast but loses quiet detail.
+///   3. Update order: push to history before or after computing the
+///      reference? Including the current frame stabilises the very
+///      first frames; excluding avoids the current loud beat
+///      flattening itself.
+///
+/// Return `[0.0, 1.0]`-ish floats — `colormap()` clamps internally.
+fn display_normalize(
+    db_frame: [f32; N_MELS],
+    history: &mut VecDeque<[f32; N_MELS]>,
+) -> [f32; N_MELS] {
+    const DYN_RANGE_DB: f32 = 60.0;
+    const FLOOR_DB: f32 = -90.0;
+
+    let mut out = [0.0_f32; N_MELS];
+    for i in 0..N_MELS {
+        let mut ref_db = FLOOR_DB;
+        for past in history.iter() {
+            if past[i] > ref_db {
+                ref_db = past[i];
+            }
+        }
+        let rel = (db_frame[i] - ref_db).clamp(-DYN_RANGE_DB, 0.0);
+        out[i] = (rel + DYN_RANGE_DB) / DYN_RANGE_DB;
+    }
+
+    if history.len() == DB_HISTORY_FRAMES {
+        history.pop_front();
+    }
+    history.push_back(db_frame);
+    out
+}
+
+/// Map a display value in [0, 1] to an inferno-ish colormap.
 fn colormap(z: f32) -> egui::Color32 {
-    let t = ((z + 2.0) / 4.0).clamp(0.0, 1.0);
+    let t = z.clamp(0.0, 1.0);
     // Smooth inferno-ish: dark → purple → red → yellow → white.
     let stops = [
         (0.00, [0x00, 0x00, 0x05]),
@@ -543,6 +590,8 @@ async fn stream_session(
     let mut samples_buf: Vec<i16> = Vec::with_capacity(2048);
     let mut mel_in: Vec<f32> = Vec::with_capacity(2048);
     let mut mel_out: Vec<[f32; N_MELS]> = Vec::with_capacity(8);
+    let mut mel_db_out: Vec<[f32; N_MELS]> = Vec::with_capacity(8);
+    let mut db_history: VecDeque<[f32; N_MELS]> = VecDeque::with_capacity(DB_HISTORY_FRAMES);
     let mut last_flush = Instant::now();
 
     let mut active_preset = *cfg.preset.lock().unwrap();
@@ -628,13 +677,18 @@ async fn stream_session(
                 let _ = tx.send(Msg::Samples(out));
 
                 // Mel-spec + Core ML inference run on RAW samples so the
-                // model sees exactly what it was trained on.
+                // model sees exactly what it was trained on. Inference
+                // path stays z-scored to match training; the UI gets the
+                // raw dB frame separately and normalizes for display so
+                // temporal contrast across cardiac cycles survives.
                 mel_out.clear();
-                mel.process(&mel_in, &mut mel_out);
-                for frame in mel_out.drain(..) {
-                    let _ = tx.send(Msg::MelFrame(frame));
+                mel_db_out.clear();
+                mel.process_with_display(&mel_in, &mut mel_out, &mut mel_db_out);
+                for (norm_frame, db_frame) in mel_out.drain(..).zip(mel_db_out.drain(..)) {
+                    let display = display_normalize(db_frame, &mut db_history);
+                    let _ = tx.send(Msg::MelFrame(display));
                     if let Some(eng) = engine.as_mut() {
-                        if let Some(prob) = eng.push_frame(&frame) {
+                        if let Some(prob) = eng.push_frame(&norm_frame) {
                             let _ = tx.send(Msg::MurmurProb(prob));
                         }
                     }

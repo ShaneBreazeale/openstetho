@@ -57,6 +57,174 @@ class MurmurCNN(nn.Module):
         return x.squeeze(-1)
 
 
+class S3CNN(nn.Module):
+    """Bigger-capacity backbone for S3 detection.
+
+    Three VGG-style conv blocks at 32 → 64 → 128 channels (~580k params,
+    ~8× MurmurCNN). Stays inside the ANE-friendly op set: Conv2D, BatchNorm,
+    ReLU, MaxPool, AdaptiveAvgPool, Linear, Dropout. No attention/RNN.
+
+    Input shape  : (B, 1, T, N_MELS) — variable T, N_MELS fixed at 32.
+    Output shape : (B,) — single logit (binary S3 head).
+
+    Dropout is raised to 0.4 vs MurmurCNN's 0.3 — larger model, same data
+    budget, more regularization needed to avoid overfitting on the synthetic
+    label distribution.
+    """
+
+    def __init__(self, n_classes: int = 1):
+        super().__init__()
+        self.b1 = conv_block(1, 32)    # (B, 32, T/2, N/2)
+        self.b2 = conv_block(32, 64)   # (B, 64, T/4, N/4)
+        self.b3 = conv_block(64, 128)  # (B, 128, T/8, N/8)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.pool(x)
+        x = self.head(x)
+        return x.squeeze(-1)
+
+
+def conv_block_pool(in_ch: int, out_ch: int, pool: tuple[int, int] = (2, 2)) -> nn.Sequential:
+    """Variant of `conv_block` with an explicit `(t, f)` pool shape so callers
+    can freeze the time axis (`pool=(1, 2)`) while still downsampling
+    frequency.
+    """
+    return nn.Sequential(
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_ch),
+        nn.ReLU(inplace=True),
+        nn.MaxPool2d(pool),
+    )
+
+
+class S3CNN_v2(nn.Module):
+    """Timing-aware backbone for S3/S4 discrimination.
+
+    The original `S3CNN` collapses both time and frequency via
+    `AdaptiveAvgPool2d(1)` — that destroys the temporal cue that
+    distinguishes S3 (early diastolic) from S4 (late diastolic). This
+    variant pools frequency only, then runs a small 1D conv head over
+    the temporal axis so the network can learn *where* in the cycle a
+    low-frequency event sits, not just whether one exists.
+
+    Pool schedule: block 1 reduces both axes (T/2, F/2). Blocks 2-3
+    reduce only frequency, so T stays at T/2 through the conv stack.
+    With our 1.5-second cycle (T≈23 mel frames) the temporal head sees
+    ~11 frames — enough to localise S3 (early diastole) vs S4 (late
+    diastole) with frame-level accuracy.
+
+    Stays ANE-friendly: Conv2D, Conv1D, BN, ReLU, MaxPool,
+    AdaptiveAvgPool, Dropout, Linear. No attention or RNN.
+
+    Roughly 4× MurmurCNN params (~290 k). The extra capacity went into
+    the temporal head, not channel width.
+    """
+
+    def __init__(self, n_classes: int = 1):
+        super().__init__()
+        self.b1 = conv_block_pool(1, 32, pool=(2, 2))    # (B, 32, T/2,  F/2)
+        self.b2 = conv_block_pool(32, 64, pool=(1, 2))   # (B, 64, T/2,  F/4)
+        self.b3 = conv_block_pool(64, 128, pool=(1, 2))  # (B, 128, T/2, F/8)
+        # Pool frequency only — keep the temporal axis intact for the head.
+        self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))  # (B, 128, T/2, 1)
+        self.temporal = nn.Sequential(
+            nn.Conv1d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),  # (B, 32, 1)
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(32, 16),
+            nn.ReLU(inplace=True),
+            nn.Linear(16, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.freq_pool(x).squeeze(-1)  # (B, 128, T/2)
+        x = self.temporal(x)               # (B, 32, 1)
+        return self.head(x).squeeze(-1)
+
+
+class S3CNN_v3(nn.Module):
+    """Wider timing-aware backbone targeting AUPRC > 0.9.
+
+    Same topology as `S3CNN_v2` (freq-only pooling after block 1, time
+    preserved through the conv stack, 1D temporal head) but widened to
+    64 → 128 → 256 channels and deepened in the temporal head from 2 to
+    3 conv1d layers. About 2.4 M parameters, ~7.5× S3CNN_v2.
+
+    Dropout is raised to 0.5 / 0.3 to compensate for the capacity bump —
+    our supervision is still synthetic so we are extra cautious about
+    fitting noise.
+
+    Stays ANE-friendly.
+    """
+
+    def __init__(self, n_classes: int = 1):
+        super().__init__()
+        self.b1 = conv_block_pool(1, 64, pool=(2, 2))      # (B, 64, T/2,  F/2)
+        self.b2 = conv_block_pool(64, 128, pool=(1, 2))    # (B, 128, T/2, F/4)
+        self.b3 = conv_block_pool(128, 256, pool=(1, 2))   # (B, 256, T/2, F/8)
+        self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))   # (B, 256, T/2, 1)
+        self.temporal = nn.Sequential(
+            nn.Conv1d(256, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.5),
+            nn.Linear(32, 32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(32, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.freq_pool(x).squeeze(-1)  # (B, 256, T/2)
+        x = self.temporal(x)               # (B, 32, 1)
+        return self.head(x).squeeze(-1)
+
+
 def count_parameters(m: nn.Module) -> int:
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
