@@ -10,7 +10,9 @@ auscultation libraries.
 |---|---|---|---|
 | UW Physical Diagnosis Demo | 16 | 1 | <https://depts.washington.edu/physdx/heart/demo.html> |
 | Michigan Heart Sound & Murmur Library | 23 | 2 | Deep Blue item `d9d03331-12f5-414e-9c19-3c5985bedb49` |
-| **combined** | **39** | **3** | |
+| MEDZCOOL "S3 Heart Sound" | 1 | 1 | YouTube `_i2D1KZkN1w` (extracted via `yt-dlp`) |
+| YouTube "S3 Gallop" | 1 | 1 | YouTube `hD-MGLD6EO0` (extracted via `yt-dlp`) |
+| **combined** | **41** | **5** | |
 
 Per-clip labels parsed from filenames (e.g. `05_apex_s3_lld_bell.mp3` → S3
 positive; `13_apex_os__dias_mur_lld_bell.mp3` → opening-snap confounder).
@@ -21,14 +23,28 @@ Full label table is in `data/s3_validation/<corpus>/labels.csv`.
 Per-clip score is the **max sigmoid** across the cycles in the recording
 (`validate_clips.score_clip` with `--crop-anchor s2`).
 
-| metric | UW (n=16) | Michigan (n=23) | combined (n=39) |
-|---|---|---|---|
-| AUROC | 1.000 | 1.000 | **1.000** |
-| AUPRC | 1.000 | 1.000 | **1.000** |
-| Sens @ 0.5 | 1.0 (1/1) | 1.0 (2/2) | 1.0 (3/3) |
-| Spec @ 0.5 | 0.53 (8/15) | 0.43 (9/21) | 0.47 (17/36) |
-| Sens @ 0.999 | 1.0 | 1.0 | **1.0** |
-| Spec @ 0.999 | 1.0 | 1.0 | **1.0** |
+Combined real-set summary (n=41, 5 S3-positive):
+
+| threshold | sensitivity | specificity | F1 | regime |
+|---|---|---|---|---|
+| 0.50 | 1.000 (5/5) | 0.472 (17/36) | 0.27 | all positives caught, ~half negatives admitted |
+| **0.934** | **1.000 (5/5)** | **0.917 (33/36)** | **0.77** | **Youden's J maximum — best balance** |
+| 0.99 | 0.800 (4/5) | 1.000 (36/36) | 0.89 | zero false positives but misses 1 S3 |
+
+Per-clip individual scores:
+- 5 real S3 clips: 1.000, 1.000, 0.999, 1.000, **0.963**
+- Highest false positive: 0.979 (Michigan #23 — ejection murmur + click)
+- Lowest true positive (0.963) is BELOW highest negative (0.979) → AUROC no longer perfect on the combined set.
+
+**Note on revised picture**: The earlier 4-of-4 streak with AUROC 1.000 broke
+when the "S3 Gallop" YouTube clip (`hD-MGLD6EO0`) scored 0.963 — likely
+because it is only 13 cycles long with intro narration / inconsistent
+gallop, vs MEDZCOOL's 105-cycle clip that scored 1.000. With more
+real-world recordings the operating point will need to be chosen, not
+asserted: either high-sensitivity (threshold ~0.93, accept ~8% false
+positives) or high-specificity (threshold ~0.99, miss ~20% of S3s). The
+real cardiologist annotation pipeline is the only path to choosing this
+trade-off responsibly.
 
 **The model achieves perfect ranking on real labeled data.** Every true S3
 clip scores above every confounder clip. Threshold needs to move from the
@@ -132,7 +148,17 @@ scripts/prepare_michigan_heart_sounds.sh \
     ~/Downloads/medical_resources-heart_sound_and_murmur_library-April15.zip \
     data/s3_validation/umich
 
-for d in uw umich; do
+# MEDZCOOL S3 teaching clip — requires yt-dlp (brew install yt-dlp).
+mkdir -p data/s3_validation/youtube && cd data/s3_validation/youtube
+yt-dlp -x --audio-format wav --audio-quality 0 -o medzcool_s3.%(ext)s \
+    https://www.youtube.com/watch?v=_i2D1KZkN1w
+ffmpeg -y -i medzcool_s3.wav -ac 1 -ar 4000 \
+    -filter:a 'loudnorm=I=-20:LRA=11:TP=-1.5' -sample_fmt s16 _tmp.wav \
+    && mv _tmp.wav medzcool_s3.wav
+printf 'filename,label_s3,kind\nmedzcool_s3.wav,1,s3_teaching\n' > labels.csv
+cd -
+
+for d in uw umich youtube; do
     uv run python -m openstetho_model.validate_clips \
         --checkpoint runs/s3_circor_v10/best.pt \
         --backbone s3cnn_v2 --crop-anchor s2 --num-classes 1 \
@@ -142,5 +168,6 @@ done
 uv run python -m openstetho_model.threshold_sweep \
     --preds data/s3_validation/uw/predictions.csv \
             data/s3_validation/umich/predictions.csv \
+            data/s3_validation/youtube/predictions.csv \
     --out  data/s3_validation/threshold_sweep.csv
 ```
