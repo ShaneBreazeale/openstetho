@@ -91,6 +91,21 @@ fn build_mel_filterbank(sample_rate: f32) -> Vec<Vec<f32>> {
     bank
 }
 
+fn z_score_clip(mut mel: [f32; N_MELS]) -> [f32; N_MELS] {
+    let mean: f32 = mel.iter().sum::<f32>() / N_MELS as f32;
+    let var: f32 = mel.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / N_MELS as f32;
+    let std = var.sqrt().max(1e-9);
+    for v in mel.iter_mut() {
+        let z = (*v - mean) / std;
+        *v = if z < NORM_CLIP_DB / 80.0 {
+            NORM_CLIP_DB / 80.0
+        } else {
+            z
+        };
+    }
+    mel
+}
+
 fn hann_window(n: usize) -> Vec<f32> {
     let denom = (n - 1) as f32;
     (0..n)
@@ -133,13 +148,35 @@ impl LogMelSpectrogram {
     pub fn process(&mut self, samples: &[f32], out: &mut Vec<[f32; N_MELS]>) {
         self.pending.extend_from_slice(samples);
         while self.pending.len() >= N_FFT {
-            self.run_one_frame(out);
+            let db = self.compute_db_frame();
+            out.push(z_score_clip(db));
             // Hop = N_FFT, so the entire frame is consumed.
             self.pending.drain(..HOP);
         }
     }
 
-    fn run_one_frame(&mut self, out: &mut Vec<[f32; N_MELS]>) {
+    /// Drain pending audio, emitting one **z-scored** inference frame and
+    /// one matching **raw dB** display frame per complete window. The two
+    /// vectors grow in lockstep. Display layers should colormap the dB
+    /// frame using a global / rolling normalization (per-frame z-score
+    /// kills temporal contrast); the model must consume the z-scored
+    /// frame to match training-time preprocessing.
+    pub fn process_with_display(
+        &mut self,
+        samples: &[f32],
+        out_norm: &mut Vec<[f32; N_MELS]>,
+        out_db: &mut Vec<[f32; N_MELS]>,
+    ) {
+        self.pending.extend_from_slice(samples);
+        while self.pending.len() >= N_FFT {
+            let db = self.compute_db_frame();
+            out_db.push(db);
+            out_norm.push(z_score_clip(db));
+            self.pending.drain(..HOP);
+        }
+    }
+
+    fn compute_db_frame(&mut self) -> [f32; N_MELS] {
         // Copy + mean-center + window into scratch.
         let mean: f32 = self.pending[..N_FFT].iter().sum::<f32>() / N_FFT as f32;
         for i in 0..N_FFT {
@@ -170,21 +207,7 @@ impl LogMelSpectrogram {
         for m in 0..N_MELS {
             mel[m] = 10.0 * (mel[m].max(LOG_FLOOR)).log10();
         }
-
-        // Per-frame z-score with -80 dB clip.
-        let mean: f32 = mel.iter().sum::<f32>() / N_MELS as f32;
-        let var: f32 = mel.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / N_MELS as f32;
-        let std = var.sqrt().max(1e-9);
-        for v in mel.iter_mut() {
-            let z = (*v - mean) / std;
-            *v = if z < NORM_CLIP_DB / 80.0 {
-                NORM_CLIP_DB / 80.0
-            } else {
-                z
-            };
-        }
-
-        out.push(mel);
+        mel
     }
 
     pub fn reset(&mut self) {

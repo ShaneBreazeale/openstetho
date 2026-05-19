@@ -17,6 +17,7 @@ dependencies = [
     "pandas>=2.1",
     "tqdm>=4.66",
     "matplotlib>=3.8",
+    "rich>=15.0.0",
 ]
 
 [build-system]
