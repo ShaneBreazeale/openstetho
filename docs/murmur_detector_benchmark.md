@@ -403,6 +403,8 @@ CV artifacts:
 - `model/runs/murmur_cv_mfcc_5s_v1/oof_predictions.csv`
 - `model/runs/murmur_cv_scattering_5s_v1/cv_report.json`
 - `model/runs/murmur_cv_scattering_5s_v1/oof_predictions.csv`
+- `model/runs/murmur_cv_logmel_5s_focal_sens_v1/cv_report.json`
+- `model/runs/murmur_cv_logmel_5s_focal_sens_v1/oof_predictions.csv`
 
 Results:
 
@@ -411,6 +413,7 @@ Results:
 | logmel 5s | 0.825 | 0.027 | 0.809 | 0.471 | 0.630 | 0.872 | 0.592 |
 | mfcc 5s | 0.854 | 0.022 | 0.800 | 0.557 | 0.573 | 0.898 | 0.582 |
 | scattering 5s + 1D-CNN | 0.522 | 0.069 | 0.517 | 0.298 | 0.998 | 0.002 | 0.340 |
+| logmel 5s + focal sensitivity tune | 0.783 | 0.023 | 0.748 | 0.790 | 0.408 | 0.938 | 0.494 |
 
 Fold AUROCs:
 
@@ -419,6 +422,7 @@ Fold AUROCs:
 | logmel 5s | 0.825 | 0.874 | 0.805 | 0.824 | 0.796 |
 | mfcc 5s | 0.881 | 0.866 | 0.849 | 0.862 | 0.815 |
 | scattering 5s + 1D-CNN | 0.565 | 0.469 | 0.462 | 0.637 | 0.476 |
+| logmel 5s + focal sensitivity tune | 0.744 | 0.812 | 0.774 | 0.800 | 0.785 |
 
 Interpretation from CV: MFCC is more consistent fold-by-fold and has the
 better mean validation AUROC, but pooled out-of-fold AUROC/F1 does not beat
@@ -453,6 +457,51 @@ for log-mel and MFCC. The useful calibrated headline is therefore:
 log-mel remains slightly ahead (`F1=0.569`, sensitivity `0.568`,
 specificity `0.890`) and has the better pooled ranking after calibration.
 
+The sensitivity-weighted run used focal BCE, 1.5x positive loss weight,
+1.5x positive replacement sampling, and F1-based checkpoint selection:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture cnn_bigru \
+    --feature-mode logmel \
+    --window-seconds 5 \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --no-cardiac \
+    --loss focal_bce \
+    --pos-weight-multiplier 1.5 \
+    --positive-sample-weight 1.5 \
+    --select-metric f1 \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cv_logmel_5s_focal_sens_v1
+```
+
+This was a negative tuning result. It increased raw threshold-0.5
+sensitivity on several folds, but transferred-threshold performance got
+worse than the baseline 5s log-mel model:
+
+| model | probability view | AUROC | Brier | ECE-10 | policy | F1 | sensitivity | specificity |
+|---|---|---:|---:|---:|---|---:|---:|---:|
+| logmel 5s baseline | Platt calibrated | 0.803 | 0.114 | 0.036 | best-F1 transfer | 0.569 | 0.568 | 0.890 |
+| logmel 5s focal tune | Platt calibrated | 0.739 | 0.136 | 0.038 | best-F1 transfer | 0.410 | 0.498 | 0.760 |
+| logmel 5s baseline | Platt calibrated | 0.803 | 0.114 | 0.036 | sensitivity >= 0.80 transfer | 0.451 | 0.800 | 0.551 |
+| logmel 5s focal tune | Platt calibrated | 0.739 | 0.136 | 0.038 | sensitivity >= 0.80 transfer | 0.431 | 0.807 | 0.503 |
+| logmel 5s baseline | Platt calibrated | 0.803 | 0.114 | 0.036 | specificity >= 0.90 transfer | 0.578 | 0.568 | 0.898 |
+| logmel 5s focal tune | Platt calibrated | 0.739 | 0.136 | 0.038 | specificity >= 0.90 transfer | 0.476 | 0.454 | 0.883 |
+
+The focal run can force the sensitivity target, but only by giving up too
+much specificity and ranking. Do not promote it over the baseline. If
+revisiting sensitivity weighting, try one knob at a time: checkpoint
+selection by F1/Youden without focal loss, or a smaller positive-sampling
+weight, before combining both.
+
 The simple wavelet-scattering implementation is a negative result in this
 pipeline. It uses Kymatio WST coefficients (`J=8`, `Q=4`) from 5-second
 windows and a small 1D-CNN, but pooled OoF AUROC is near chance. Do not
@@ -480,6 +529,9 @@ architecture from scratch.
 - Use the new `cross_fold_calibration` section in `cv_report.json` for model
   selection. It reports Brier/ECE plus fold-held-out threshold transfer, so
   it is less optimistic than pooled best-F1 threshold selection.
-- Next CNN+BiGRU work should focus on changing the training objective or
-  sampling strategy to improve sensitivity at acceptable specificity; Platt
-  calibration improves probability quality but not the underlying ranking.
+- Do not promote the first focal sensitivity-weighted log-mel run. It hurts
+  AUROC and transferred-threshold F1 despite improving some raw recall
+  operating points.
+- Next CNN+BiGRU work should isolate sensitivity knobs one at a time:
+  F1/Youden checkpoint selection without focal loss, then smaller positive
+  sampling or positive-weight multipliers if needed.

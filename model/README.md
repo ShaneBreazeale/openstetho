@@ -115,6 +115,14 @@ The research path supports alternate feature and window experiments:
   PyTorch-only `scattering_cnn1d` architecture
 - `--architecture scattering_cnn1d`: small 1D-CNN for scattering features
 - `--window-seconds 5`: 5-second windows with 50 percent overlap by default
+- `--loss focal_bce`: focal BCE for sensitivity-weighted experiments
+- `--loss asymmetric_focal`: asymmetric focal BCE for separate positive /
+  negative focusing
+- `--pos-weight-multiplier N`: multiply the class-balanced positive loss
+  weight
+- `--positive-sample-weight N`: replacement-sample positives more often
+- `--select-metric {auc,f1,youden_j}`: choose the best CV checkpoint by a
+  validation metric
 - `--lr-scheduler plateau`: validation-AUC `ReduceLROnPlateau`
 - `--early-stopping-patience N`: stop after N non-improving validation epochs
 
@@ -133,6 +141,10 @@ fold it fits Platt/isotonic probability calibration and best-F1 / Youden-J
 thresholds on the other folds' out-of-fold predictions, then applies those
 choices to the held-out fold. Use that section for calibrated Brier/ECE and
 threshold-transfer metrics; the pooled `best_f1` threshold is optimistic.
+The first combined focal / positive-weight / positive-sampling run improved
+some raw sensitivity operating points but reduced pooled AUROC and
+transferred-threshold F1, so keep the original 5-second log-mel CNN+BiGRU as
+the current lead.
 
 ```bash
 uv run --project model python -m openstetho_model.cv_murmur \

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -21,10 +20,13 @@ from .dataset import CirCorRecordingMurmurDataset, window_hop_samples
 from .model import count_parameters
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
 from .train import (
+    LOSS_TYPES,
     _patient_labels,
     aggregate_logits,
+    build_loss_fn,
     build_model,
     device,
+    positive_weighted_sampler,
     recording_collate,
     run_recording_epoch,
 )
@@ -32,7 +34,7 @@ from .train import (
 log = logging.getLogger("cv_murmur")
 PROB_EPS = 1e-6
 CALIBRATION_METHODS = ("none", "platt", "isotonic")
-THRESHOLD_KEYS = ("best_f1", "best_youden_j")
+THRESHOLD_KEYS = ("best_f1", "best_youden_j", "sensitivity_ge_0_80", "specificity_ge_0_90")
 THRESHOLD_METRICS = {"best_f1": "f1", "best_youden_j": "youden_j"}
 
 
@@ -80,10 +82,12 @@ def train_fold(
     train_ds = Subset(ds, train_idx)
     val_ds = Subset(ds, val_idx)
     pin = dev.type in ("cuda",)
+    sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed + fold)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.workers,
         pin_memory=pin,
         drop_last=True,
@@ -101,9 +105,15 @@ def train_fold(
     channels = feature_channels(args.feature_mode)
     model = build_model(args.architecture, in_channels=channels).to(dev)
     bal = subset_balance(ds, train_idx)
-    pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1))
+    pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1)) * args.pos_weight_multiplier
     pos_weight = torch.tensor([pos_weight_val], device=dev)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    loss_fn = build_loss_fn(
+        args.loss,
+        pos_weight,
+        focal_gamma=args.focal_gamma,
+        asymmetric_gamma_pos=args.asymmetric_gamma_pos,
+        asymmetric_gamma_neg=args.asymmetric_gamma_neg,
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = None
     if args.lr_scheduler == "plateau":
@@ -115,6 +125,7 @@ def train_fold(
         )
 
     best_auc = float("-inf")
+    best_select = float("-inf")
     saved_best = False
     best_epoch = 0
     epochs_since_improvement = 0
@@ -126,6 +137,18 @@ def train_fold(
         va_loss, va_auc = run_recording_epoch(
             model, val_loader, loss_fn, None, dev, args.aggregation, args.topk
         )
+        va_select = va_auc
+        if args.select_metric != "auc":
+            va_predictions = predict_recordings(model, val_loader, dev, args.aggregation, args.topk)
+            va_labels = np.asarray([label for label, _prob in va_predictions], dtype=np.int64)
+            va_probs = np.asarray([prob for _label, prob in va_predictions], dtype=np.float64)
+            va_metrics = summarize(va_labels, va_probs, args.threshold)
+            if args.select_metric == "f1":
+                va_select = float(va_metrics["best_f1"]["f1"])  # type: ignore[index]
+            elif args.select_metric == "youden_j":
+                va_select = float(va_metrics["best_youden_j"]["youden_j"])  # type: ignore[index]
+            else:
+                raise ValueError(f"unknown select metric {args.select_metric!r}")
         lr_now = float(opt.param_groups[0]["lr"])
         history.append({
             "epoch": epoch,
@@ -133,22 +156,29 @@ def train_fold(
             "tr_auc": tr_auc,
             "va_loss": va_loss,
             "va_auc": va_auc,
+            "va_select": va_select,
             "lr": lr_now,
         })
         log.info(
-            "fold %02d ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f",
+            "fold %02d ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f select %.3f",
             fold,
             epoch,
             tr_loss,
             tr_auc,
             va_loss,
             va_auc,
+            va_select,
         )
         torch.save(model.state_dict(), fold_dir / "last.pt")
-        improved = bool(np.isfinite(va_auc) and va_auc > best_auc + args.early_stopping_min_delta)
+        improved = bool(
+            np.isfinite(va_select)
+            and va_select > best_select + args.early_stopping_min_delta
+        )
         if improved or not saved_best:
             if np.isfinite(va_auc):
                 best_auc = va_auc
+            if np.isfinite(va_select):
+                best_select = va_select
             if improved:
                 epochs_since_improvement = 0
             saved_best = True
@@ -165,9 +195,10 @@ def train_fold(
             and epochs_since_improvement >= args.early_stopping_patience
         ):
             log.info(
-                "fold %02d early stopping after %d epochs without validation-AUC improvement",
+                "fold %02d early stopping after %d epochs without validation-%s improvement",
                 fold,
                 epochs_since_improvement,
+                args.select_metric,
             )
             break
 
@@ -176,6 +207,8 @@ def train_fold(
         "fold": fold,
         "best_epoch": best_epoch,
         "best_val_auc": best_auc,
+        "best_select_metric": args.select_metric,
+        "best_select_score": best_select,
         "train_recordings": len(train_idx),
         "val_recordings": len(val_idx),
         "train_balance": bal,
@@ -189,6 +222,13 @@ def train_fold(
         "hop_seconds": args.hop_seconds_effective,
         "lr_scheduler": args.lr_scheduler,
         "early_stopping_patience": args.early_stopping_patience,
+        "loss": args.loss,
+        "pos_weight": pos_weight_val,
+        "pos_weight_multiplier": args.pos_weight_multiplier,
+        "focal_gamma": args.focal_gamma,
+        "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
+        "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
+        "positive_sample_weight": args.positive_sample_weight,
         "params": count_parameters(model),
     }
     (fold_dir / "best_meta.json").write_text(json.dumps(json_safe(meta), indent=2))
@@ -329,12 +369,40 @@ def calibration_curve_points(
     ]
 
 
+def threshold_policy_row(rows: list[dict[str, float]], policy: str) -> dict[str, float]:
+    if policy in THRESHOLD_METRICS:
+        out = dict(best_by(rows, THRESHOLD_METRICS[policy]))
+        out["constraint_met"] = 1.0
+        return out
+    if policy == "sensitivity_ge_0_80":
+        candidates = [row for row in rows if row["sensitivity"] >= 0.80]
+        if candidates:
+            out = dict(max(candidates, key=lambda r: (r["specificity"], r["f1"], r["threshold"])))
+            out["constraint_met"] = 1.0
+            return out
+        out = dict(max(rows, key=lambda r: (r["sensitivity"], r["specificity"], r["f1"])))
+        out["constraint_met"] = 0.0
+        return out
+    if policy == "specificity_ge_0_90":
+        candidates = [row for row in rows if row["specificity"] >= 0.90]
+        if candidates:
+            out = dict(max(candidates, key=lambda r: (r["sensitivity"], r["f1"], r["threshold"])))
+            out["constraint_met"] = 1.0
+            return out
+        out = dict(max(rows, key=lambda r: (r["specificity"], r["sensitivity"], r["f1"])))
+        out["constraint_met"] = 0.0
+        return out
+    raise ValueError(f"unknown threshold policy {policy!r}; valid: {THRESHOLD_KEYS}")
+
+
 def summarize(labels: np.ndarray, probs: np.ndarray, threshold: float) -> dict[str, object]:
     rows = sweep_thresholds(labels, probs)
     return {
         "threshold": binary_metrics(labels, probs, threshold),
         "best_f1": best_by(rows, "f1"),
         "best_youden_j": best_by(rows, "youden_j"),
+        "sensitivity_ge_0_80": threshold_policy_row(rows, "sensitivity_ge_0_80"),
+        "specificity_ge_0_90": threshold_policy_row(rows, "specificity_ge_0_90"),
         **probability_metrics(labels, probs),
         "calibration_curve_10": calibration_curve_points(labels, probs, n_bins=10),
     }
@@ -371,9 +439,11 @@ def cross_fold_calibration_report(
             train_sweep = sweep_thresholds(train_labels, train_calibrated)
             row: dict[str, object] = {"fold": int(fold)}
             for key in THRESHOLD_KEYS:
-                threshold = float(best_by(train_sweep, THRESHOLD_METRICS[key])["threshold"])
+                threshold_meta = threshold_policy_row(train_sweep, key)
+                threshold = float(threshold_meta["threshold"])
                 threshold_predictions[key][val_mask] = (val_calibrated >= threshold).astype(np.int64)
                 row[f"{key}_threshold"] = threshold
+                row[f"{key}_constraint_met"] = float(threshold_meta["constraint_met"])
             row.update(probability_metrics(labels[val_mask], val_calibrated))
             fold_rows.append(row)
 
@@ -477,6 +547,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "lr": args.lr,
         "lr_scheduler": args.lr_scheduler,
         "early_stopping_patience": args.early_stopping_patience,
+        "select_metric": args.select_metric,
+        "loss": args.loss,
+        "pos_weight_multiplier": args.pos_weight_multiplier,
+        "focal_gamma": args.focal_gamma,
+        "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
+        "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
+        "positive_sample_weight": args.positive_sample_weight,
         "n_recordings": int(labels.size),
         "positives": int(labels.sum()),
         "fold_reports": fold_reports,
@@ -522,6 +599,13 @@ def main() -> None:
     p.add_argument("--aggregation", choices=["mean", "topk_mean", "max"], default="mean")
     p.add_argument("--topk", type=int, default=3)
     p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--select-metric", choices=["auc", "f1", "youden_j"], default="auc")
+    p.add_argument("--loss", choices=LOSS_TYPES, default="bce")
+    p.add_argument("--pos-weight-multiplier", type=float, default=1.0)
+    p.add_argument("--focal-gamma", type=float, default=2.0)
+    p.add_argument("--asymmetric-gamma-pos", type=float, default=0.0)
+    p.add_argument("--asymmetric-gamma-neg", type=float, default=2.0)
+    p.add_argument("--positive-sample-weight", type=float, default=1.0)
     p.add_argument("--lr-scheduler", choices=["none", "plateau"], default="plateau")
     p.add_argument("--plateau-patience", type=int, default=1)
     p.add_argument("--plateau-factor", type=float, default=0.5)

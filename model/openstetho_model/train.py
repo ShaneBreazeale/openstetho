@@ -19,14 +19,16 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from .dataset import CirCorMurmurDataset, CirCorRecordingMurmurDataset, window_hop_samples
 from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D, count_parameters
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
 
 log = logging.getLogger("train")
+LOSS_TYPES = ("bce", "focal_bce", "asymmetric_focal")
 
 
 def build_model(architecture: str, in_channels: int = 1) -> nn.Module:
@@ -37,6 +39,108 @@ def build_model(architecture: str, in_channels: int = 1) -> nn.Module:
     if architecture == "scattering_cnn1d":
         return MurmurScatteringCNN1D()
     raise ValueError(f"unknown architecture {architecture}")
+
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    def __init__(self, pos_weight: torch.Tensor, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight)
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.float()
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            pos_weight=self.pos_weight,
+            reduction="none",
+        )
+        probs = torch.sigmoid(logits)
+        pt = torch.where(labels == 1, probs, 1.0 - probs)
+        return (((1.0 - pt).clamp_min(1e-6) ** self.gamma) * bce).mean()
+
+
+class AsymmetricFocalBCEWithLogitsLoss(nn.Module):
+    def __init__(
+        self,
+        pos_weight: torch.Tensor,
+        gamma_pos: float = 0.0,
+        gamma_neg: float = 2.0,
+    ):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight)
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        labels = labels.float()
+        bce = F.binary_cross_entropy_with_logits(
+            logits,
+            labels,
+            pos_weight=self.pos_weight,
+            reduction="none",
+        )
+        probs = torch.sigmoid(logits)
+        pt = torch.where(labels == 1, probs, 1.0 - probs)
+        gamma = torch.where(
+            labels == 1,
+            torch.full_like(labels, self.gamma_pos),
+            torch.full_like(labels, self.gamma_neg),
+        )
+        return (((1.0 - pt).clamp_min(1e-6) ** gamma) * bce).mean()
+
+
+def build_loss_fn(
+    loss: str,
+    pos_weight: torch.Tensor,
+    focal_gamma: float = 2.0,
+    asymmetric_gamma_pos: float = 0.0,
+    asymmetric_gamma_neg: float = 2.0,
+) -> nn.Module:
+    if loss == "bce":
+        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if loss == "focal_bce":
+        return FocalBCEWithLogitsLoss(pos_weight=pos_weight, gamma=focal_gamma)
+    if loss == "asymmetric_focal":
+        return AsymmetricFocalBCEWithLogitsLoss(
+            pos_weight=pos_weight,
+            gamma_pos=asymmetric_gamma_pos,
+            gamma_neg=asymmetric_gamma_neg,
+        )
+    raise ValueError(f"unknown loss {loss!r}; valid: {LOSS_TYPES}")
+
+
+def labels_for_dataset(dataset) -> list[int]:
+    if isinstance(dataset, Subset):
+        base_labels = labels_for_dataset(dataset.dataset)
+        return [base_labels[int(i)] for i in dataset.indices]
+    if isinstance(dataset, CirCorRecordingMurmurDataset):
+        return [int(label) for *_rest, label in dataset._records]
+    if isinstance(dataset, CirCorMurmurDataset):
+        return [int(label) for *_rest, label, _w in dataset._index]
+    return [int(dataset[i][1]) for i in range(len(dataset))]
+
+
+def positive_weighted_sampler(
+    dataset,
+    positive_sample_weight: float,
+    seed: int,
+) -> WeightedRandomSampler | None:
+    if positive_sample_weight <= 1.0:
+        return None
+    labels = labels_for_dataset(dataset)
+    weights = torch.tensor(
+        [positive_sample_weight if label == 1 else 1.0 for label in labels],
+        dtype=torch.double,
+    )
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return WeightedRandomSampler(
+        weights,
+        num_samples=len(weights),
+        replacement=True,
+        generator=generator,
+    )
 
 
 def device(preferred: str = "auto") -> torch.device:
@@ -211,6 +315,22 @@ def main():
     )
     p.add_argument("--aggregation", choices=["mean", "topk_mean", "max"], default="mean")
     p.add_argument("--topk", type=int, default=3, help="k for --aggregation topk_mean")
+    p.add_argument("--loss", choices=LOSS_TYPES, default="bce")
+    p.add_argument(
+        "--pos-weight-multiplier",
+        type=float,
+        default=1.0,
+        help="multiply the class-balanced BCE/focal positive weight",
+    )
+    p.add_argument("--focal-gamma", type=float, default=2.0)
+    p.add_argument("--asymmetric-gamma-pos", type=float, default=0.0)
+    p.add_argument("--asymmetric-gamma-neg", type=float, default=2.0)
+    p.add_argument(
+        "--positive-sample-weight",
+        type=float,
+        default=1.0,
+        help="if >1, use replacement sampling that draws positive recordings/windows more often",
+    )
     p.add_argument(
         "--lr-scheduler",
         choices=["none", "plateau"],
@@ -274,11 +394,14 @@ def main():
         log.info("split:  train=%d  val=%d", len(train_ds), len(val_ds))
 
     pin = dev.type in ("cuda",)
+    sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed)
+    shuffle_train = sampler is None
     if args.level == "recording":
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=shuffle_train,
+            sampler=sampler,
             num_workers=args.workers,
             pin_memory=pin,
             drop_last=True,
@@ -294,7 +417,7 @@ def main():
         )
     else:
         train_loader = DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=True,
+            train_ds, batch_size=args.batch_size, shuffle=shuffle_train, sampler=sampler,
             num_workers=args.workers, pin_memory=pin, drop_last=True,
         )
         val_loader = DataLoader(
@@ -308,10 +431,21 @@ def main():
     # Class-balanced loss: pos_weight = N_neg / N_pos so the minority
     # (murmur-present) class gets a proportional gradient pull.
     bal = ds.class_balance()
-    pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1))
-    log.info("pos_weight: %.3f", pos_weight_val)
+    pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1)) * args.pos_weight_multiplier
+    log.info(
+        "loss=%s pos_weight=%.3f positive_sample_weight=%.3f",
+        args.loss,
+        pos_weight_val,
+        args.positive_sample_weight,
+    )
     pos_weight = torch.tensor([pos_weight_val], device=dev)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    loss_fn = build_loss_fn(
+        args.loss,
+        pos_weight,
+        focal_gamma=args.focal_gamma,
+        asymmetric_gamma_pos=args.asymmetric_gamma_pos,
+        asymmetric_gamma_neg=args.asymmetric_gamma_neg,
+    )
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = None
     if args.lr_scheduler == "plateau":
@@ -367,6 +501,13 @@ def main():
                 "hop_seconds": hop_seconds,
                 "lr_scheduler": args.lr_scheduler,
                 "early_stopping_patience": args.early_stopping_patience,
+                "loss": args.loss,
+                "pos_weight": pos_weight_val,
+                "pos_weight_multiplier": args.pos_weight_multiplier,
+                "focal_gamma": args.focal_gamma,
+                "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
+                "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
+                "positive_sample_weight": args.positive_sample_weight,
                 "aggregation": args.aggregation if args.level == "recording" else None,
                 "topk": args.topk if args.level == "recording" else None,
             }))

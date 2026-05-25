@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import torch
 import numpy as np
+import torch
 
 from openstetho_model.cv_murmur import (
     calibrate_probs,
     cross_fold_calibration_report,
     expected_calibration_error,
     stratified_patient_folds,
+    threshold_policy_row,
 )
 from openstetho_model.dataset import window_hop_samples
-from openstetho_model.train import aggregate_logits, build_model, recording_collate
+from openstetho_model.train import aggregate_logits, build_loss_fn, build_model, recording_collate
 
 
 def test_aggregate_logits_mean():
@@ -30,6 +31,15 @@ def test_recording_collate_keeps_variable_window_counts():
     recordings, labels = recording_collate([(rec_a, 0), (rec_b, 1)])
     assert [r.shape[0] for r in recordings] == [2, 5]
     assert labels.tolist() == [0.0, 1.0]
+
+
+def test_focal_loss_downweights_easy_examples():
+    logits = torch.tensor([-4.0, 4.0])
+    labels = torch.tensor([0.0, 1.0])
+    pos_weight = torch.tensor([1.0])
+    bce = build_loss_fn("bce", pos_weight)(logits, labels)
+    focal = build_loss_fn("focal_bce", pos_weight, focal_gamma=2.0)(logits, labels)
+    assert focal.item() < bce.item()
 
 
 def test_cnn_bigru_forward_accepts_window_batch():
@@ -97,7 +107,26 @@ def test_cross_fold_calibration_reports_transfer_metrics():
     assert set(report) == {"none", "platt", "isotonic"}
     none_report = report["none"]
     assert none_report["probability"]["auroc"] == 1.0
-    assert set(none_report["threshold_transfer"]) == {"best_f1", "best_youden_j"}
+    assert set(none_report["threshold_transfer"]) == {
+        "best_f1",
+        "best_youden_j",
+        "sensitivity_ge_0_80",
+        "specificity_ge_0_90",
+    }
     assert none_report["threshold_transfer"]["best_f1"]["f1"] > 0.8
     assert "threshold_mean" in none_report["threshold_transfer"]["best_f1"]
     assert len(none_report["folds"]) == 4
+
+
+def test_threshold_policy_reports_clinical_targets():
+    rows = [
+        {"threshold": 0.2, "sensitivity": 1.0, "specificity": 0.2, "f1": 0.5, "youden_j": 0.2},
+        {"threshold": 0.5, "sensitivity": 0.8, "specificity": 0.9, "f1": 0.7, "youden_j": 0.7},
+        {"threshold": 0.8, "sensitivity": 0.4, "specificity": 1.0, "f1": 0.6, "youden_j": 0.4},
+    ]
+    sens = threshold_policy_row(rows, "sensitivity_ge_0_80")
+    spec = threshold_policy_row(rows, "specificity_ge_0_90")
+    assert sens["threshold"] == 0.5
+    assert spec["threshold"] == 0.5
+    assert sens["constraint_met"] == 1.0
+    assert spec["constraint_met"] == 1.0
