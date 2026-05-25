@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 from .dataset import CirCorMurmurDataset, _patient_recordings
-from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D
+from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D, MurmurScatteringTransformer
 from .preprocess import (
     FEATURE_MODES,
     FEATURE_MODE_LOGMEL,
@@ -237,6 +237,8 @@ class TorchScorer:
             self.model = MurmurCNNBiGRU(in_channels=self.in_channels)
         elif self.architecture == "scattering_cnn1d":
             self.model = MurmurScatteringCNN1D()
+        elif self.architecture == "scattering_transformer":
+            self.model = MurmurScatteringTransformer()
         else:
             raise ValueError(f"unknown architecture {self.architecture}")
         state = torch.load(self.path, map_location="cpu", weights_only=True)
@@ -722,7 +724,11 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, required=True, help="CirCor root")
     p.add_argument("--checkpoint", type=Path, default=None, help="PyTorch MurmurCNN checkpoint")
-    p.add_argument("--architecture", choices=["cnn", "cnn_bigru", "scattering_cnn1d"], default="cnn")
+    p.add_argument(
+        "--architecture",
+        choices=["cnn", "cnn_bigru", "scattering_cnn1d", "scattering_transformer"],
+        default="cnn",
+    )
     p.add_argument(
         "--feature-mode",
         choices=FEATURE_MODES,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
 
 from .preprocess import N_MELS
@@ -67,8 +68,19 @@ class MurmurCNNBiGRU(nn.Module):
     `MurmurCNN`.
     """
 
-    def __init__(self, n_classes: int = 1, hidden_size: int = 48, in_channels: int = 1):
+    def __init__(
+        self,
+        n_classes: int = 1,
+        hidden_size: int = 48,
+        in_channels: int = 1,
+        wide_feature_dim: int = 0,
+        max_input_frames: int = 192,
+        max_gru_steps: int = 96,
+    ):
         super().__init__()
+        self.max_input_frames = max_input_frames
+        self.max_gru_steps = max_gru_steps
+        self.wide_feature_dim = wide_feature_dim
         self.b1 = conv_block_pool(in_channels, 24, pool=(2, 2))
         self.b2 = conv_block_pool(24, 48, pool=(1, 2))
         self.b3 = conv_block_pool(48, 96, pool=(1, 2))
@@ -80,24 +92,51 @@ class MurmurCNNBiGRU(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
+        head_in = hidden_size * 2
+        if wide_feature_dim > 0:
+            self.wide_branch = nn.Sequential(
+                nn.Linear(wide_feature_dim, 32),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(32, 16),
+                nn.ReLU(inplace=True),
+            )
+            head_in += 16
+        else:
+            self.wide_branch = None
         self.head = nn.Sequential(
             nn.Dropout(0.4),
-            nn.Linear(hidden_size * 2, 48),
+            nn.Linear(head_in, 48),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(48, n_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, wide: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim == 3:
             x = x.unsqueeze(1)
+        if x.shape[-2] > self.max_input_frames:
+            x = F.interpolate(
+                x,
+                size=(self.max_input_frames, x.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            )
         x = self.b1(x)
         x = self.b2(x)
         x = self.b3(x)
         x = self.freq_pool(x).squeeze(-1)  # (B, C, T')
+        if x.shape[-1] > self.max_gru_steps:
+            x = F.adaptive_avg_pool1d(x, self.max_gru_steps)
         x = x.transpose(1, 2)              # (B, T', C)
         seq, _ = self.gru(x)
         pooled = seq.mean(dim=1)
+        if self.wide_branch is not None:
+            if wide is None:
+                raise ValueError("wide features are required for this MurmurCNNBiGRU")
+            if wide.ndim == 1:
+                wide = wide.unsqueeze(0)
+            pooled = torch.cat([pooled, self.wide_branch(wide.float())], dim=1)
         return self.head(pooled).squeeze(-1)
 
 
@@ -143,6 +182,75 @@ class MurmurScatteringCNN1D(nn.Module):
         x = x.transpose(1, 2)
         x = self.features(x)
         return self.head(x).squeeze(-1)
+
+
+class MurmurScatteringTransformer(nn.Module):
+    """Contextualized scattering baseline with fixed positional encoding.
+
+    This is a lightweight research comparator inspired by the Scattering
+    Transformer paper: wavelet-scattering coefficients are projected into a
+    small token space, receive parameter-free sinusoidal positional encoding,
+    and pass through self-attention before temporal pooling. It is not an
+    ANE/Core ML deployment candidate.
+    """
+
+    def __init__(
+        self,
+        n_classes: int = 1,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.input_proj = nn.LazyLinear(d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 2,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(d_model, 32),
+            nn.GELU(),
+            nn.Dropout(0.15),
+            nn.Linear(32, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        if x.ndim != 3:
+            raise ValueError(f"expected (B,T,C) scattering input, got {tuple(x.shape)}")
+        x = self.input_proj(x.float())
+        x = x + sinusoidal_position_encoding(x.shape[1], self.d_model, x.device, x.dtype)
+        x = self.encoder(x)
+        pooled = self.norm(x).mean(dim=1)
+        return self.head(pooled).squeeze(-1)
+
+
+def sinusoidal_position_encoding(
+    length: int,
+    d_model: int,
+    dev: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    position = torch.arange(length, device=dev, dtype=dtype).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, d_model, 2, device=dev, dtype=dtype)
+        * (-torch.log(torch.tensor(10000.0, device=dev, dtype=dtype)) / d_model)
+    )
+    pe = torch.zeros(length, d_model, device=dev, dtype=dtype)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    if d_model > 1:
+        pe[:, 1::2] = torch.cos(position * div_term[: pe[:, 1::2].shape[1]])
+    return pe.unsqueeze(0)
 
 
 class S3CNN(nn.Module):

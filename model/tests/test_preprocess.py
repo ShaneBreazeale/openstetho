@@ -9,6 +9,7 @@ import pytest
 from openstetho_model.preprocess import (
     F_MAX,
     F_MIN,
+    HEARHEART_N_MELS,
     MEL_FFT_BINS,
     N_FFT,
     N_MELS,
@@ -17,6 +18,7 @@ from openstetho_model.preprocess import (
     apply_cardiac,
     feature_channels,
     log_mel,
+    log_mel128,
     mel_filterbank,
     mfcc,
     scattering_features,
@@ -71,6 +73,14 @@ def test_log_mel_dimensions_match_window():
     mel = log_mel(audio)
     # WINDOW_SAMPLES / STFT_HOP (256) = 62.5; integer-truncated → 62 frames.
     assert mel.shape == (62, N_MELS)
+
+
+def test_logmel128_dimensions_match_hearheart_style_window():
+    audio = np.random.randn(15 * SAMPLE_RATE).astype(np.float32)
+    mel = log_mel128(audio)
+    # 15s with 50 ms analysis windows and 25 ms hop.
+    assert mel.shape == (599, HEARHEART_N_MELS)
+    assert feature_channels("logmel128") == 1
 
 
 def test_multi_channel_features_match_window_shape():

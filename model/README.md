@@ -110,10 +110,18 @@ uv run --project model python -m openstetho_model.train \
 The research path supports alternate feature and window experiments:
 
 - `--feature-mode mfcc`: single-channel MFCC-only input
+- `--feature-mode logmel128`: HearHeart-style research log-mel input
+  with 128 mel bins, 25-2000 Hz, 50 ms Hamming windows, and 25 ms hop
 - `--feature-mode multi`: stacked log-mel, MFCC, and log-STFT energy maps
 - `--feature-mode scattering`: wavelet-scattering coefficients for the
   PyTorch-only `scattering_cnn1d` architecture
 - `--architecture scattering_cnn1d`: small 1D-CNN for scattering features
+- `--architecture scattering_transformer`: contextualized scattering
+  baseline with fixed sinusoidal positional encoding and lightweight
+  self-attention; use with `--feature-mode scattering`
+- `--wide-features`: add a recording-level side branch with train-fold
+  normalized patient metadata and recording statistics; currently requires
+  `--level recording --architecture cnn_bigru`
 - `--window-seconds 5`: 5-second windows with 50 percent overlap by default
 - `--loss focal_bce`: focal BCE for sensitivity-weighted experiments
 - `--loss asymmetric_focal`: asymmetric focal BCE for separate positive /
@@ -121,8 +129,23 @@ The research path supports alternate feature and window experiments:
 - `--pos-weight-multiplier N`: multiply the class-balanced positive loss
   weight
 - `--positive-sample-weight N`: replacement-sample positives more often
+- `--audio-noise-snr-db 15 --audio-noise-prob 0.5`: add train-fold-only
+  Gaussian audio noise
+- `--train-random-crop`: train on one random window per recording while
+  keeping validation/test aggregation on deterministic overlapped windows
+- `--window-jitter-seconds N`: train-fold-only random crop/window-start
+  jitter
+- `--time-shift-seconds N --time-shift-prob P`: train-fold-only circular
+  audio shift jitter
+- `--freq-mask-max-width N --time-mask-max-width N`: train-fold-only
+  SpecAugment-style masking after feature extraction
 - `--select-metric {auc,f1,youden_j}`: choose the best CV checkpoint by a
   validation metric
+- `--teacher-predictions-csv PATH`: optional recording-level soft targets
+  for local distillation experiments; current docs label the local source as
+  CirCor2022
+- `--teacher-distill-weight N`: extra BCE weight applied where finite
+  soft targets exist
 - `--lr-scheduler plateau`: validation-AUC `ReduceLROnPlateau`
 - `--early-stopping-patience N`: stop after N non-improving validation epochs
 
@@ -136,6 +159,39 @@ initial wavelet-scattering + 1D-CNN run was a negative result in this
 pipeline, with pooled out-of-fold AUROC near chance, so keep it as a
 research branch rather than a model candidate.
 
+The scattering follow-up should use the contextualized
+`scattering_transformer` architecture, not the old plain scattering 1D-CNN:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture scattering_transformer \
+    --feature-mode scattering \
+    --window-seconds 5 \
+    --aggregation mean \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device mps \
+    --no-cardiac \
+    --loss bce \
+    --lr 3e-4 \
+    --grad-clip-norm 5 \
+    --select-metric f1 \
+    --feature-cache-dir model/runs/feature_cache \
+    --out model/runs/murmur_cv_scattering_transformer_5s_v1
+```
+
+Use `--feature-cache-dir` for scattering runs. Kymatio feature extraction is
+the slow part; the cache stores deterministic per-recording feature tensors
+and avoids recomputing them across folds or reruns. For quick integration
+checks, add `--max-patients N` to run a stratified patient subset. A
+10-patient / 2-fold / 1-epoch smoke completed successfully. The full
+5-fold contextual scattering benchmark also completed, but it is not a lead
+candidate: fold AUROC mean `0.711`, pooled OoF AUROC `0.699`, Platt AUROC
+`0.691`, and Platt transferred best-F1 `0.412`.
+
 `cv_murmur` also writes a `cross_fold_calibration` report. For each held-out
 fold it fits Platt/isotonic probability calibration and best-F1 / Youden-J
 thresholds on the other folds' out-of-fold predictions, then applies those
@@ -143,10 +199,97 @@ choices to the held-out fold. Use that section for calibrated Brier/ECE and
 threshold-transfer metrics; the pooled `best_f1` threshold is optimistic.
 The first combined focal / positive-weight / positive-sampling run improved
 some raw sensitivity operating points but reduced pooled AUROC and
-transferred-threshold F1. The current research lead is the 5-second log-mel
+transferred-threshold F1. The clean baseline is the 5-second log-mel
 CNN+BiGRU trained with standard BCE and selected by validation F1 or
 Youden-J; both selection policies picked the same epochs in the seed-0
 5-fold run and improved Platt-calibrated transferred best-F1 to `0.597`.
+The current local research lead adds CirCor2022 positive-only soft targets
+at `--teacher-distill-weight 0.2`: pooled OoF AUROC `0.829`, Platt AUROC
+`0.823`, and Platt-calibrated transferred best-F1 `0.626` with sensitivity
+`0.573` / specificity `0.934`. It is not a clean public recipe because the
+CirCor2022 soft-target CSV covers only present-label recordings.
+
+A full positive+negative CirCor2022 soft-target score file was also
+generated under
+`model/runs/murmur_bench/full_all_tflite_teacher_predictions.csv`, covering
+all `2,964` present/absent recordings. The CirCor2022 soft-target source is
+only a moderate CirCor ranker by itself, and a full-target soft-target +
+positive-weight CV run hurt calibrated transfer badly. Do not promote
+full-target distillation from that source.
+
+HearHeart-style wide features are available for the current 5-second
+CNN+BiGRU path. The vector includes age bucket, sex, pregnancy status,
+height/weight with missing indicators, auscultation location, duration,
+RMS, zero-crossing rate, spectral centroid, and spectral bandwidth. Scaling
+is fit on each train fold only before validation:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture cnn_bigru \
+    --wide-features \
+    --feature-mode logmel \
+    --window-seconds 5 \
+    --aggregation mean \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device mps \
+    --no-cardiac \
+    --loss bce \
+    --lr 3e-4 \
+    --grad-clip-norm 5 \
+    --select-metric f1 \
+    --out model/runs/murmur_cv_logmel_5s_wide_v2
+```
+
+The full 5-fold run completed. It improved mean fold AUROC versus the
+5-second log-mel lead (`0.844` vs `0.825`), but hurt pooled and
+cross-fold-calibrated metrics: pooled OoF AUROC `0.776`, Platt AUROC
+`0.741`, and Platt transferred best-F1 `0.499`. Do not promote the
+wide-feature branch yet; treat it as evidence that the side features can
+help within-fold ranking while making cross-fold score calibration worse.
+
+HearHeart-style 15-second log-mel CV is now expressible without changing
+the deployed mel path. Training uses one random 15-second crop per
+recording; validation/test folds stay deterministic with overlapped
+recording-level mean aggregation. Use MPS when available. The full 5-fold
+run completed, but it was a negative result and should not replace the
+5-second log-mel lead.
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture cnn_bigru \
+    --feature-mode logmel128 \
+    --window-seconds 15 \
+    --hop-seconds 7.5 \
+    --aggregation mean \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device mps \
+    --no-cardiac \
+    --loss bce \
+    --lr 1e-4 \
+    --grad-clip-norm 5 \
+    --select-metric f1 \
+    --train-random-crop \
+    --audio-noise-snr-db 15 \
+    --audio-noise-prob 0.5 \
+    --window-jitter-seconds 0.5 \
+    --time-shift-seconds 0.5 \
+    --time-shift-prob 0.5 \
+    --freq-mask-max-width 16 \
+    --time-mask-max-width 40 \
+    --out model/runs/murmur_cv_logmel128_15s_aug_v3
+```
+
+Result summary for `murmur_cv_logmel128_15s_aug_v3`: fold AUROC mean
+`0.520`, pooled OoF AUROC `0.500`, Platt AUROC `0.496`, and Platt
+transferred best-F1 `0.325`. Treat this as a negative benchmark result.
 
 ```bash
 uv run --project model python -m openstetho_model.cv_murmur \

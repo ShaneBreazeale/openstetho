@@ -16,19 +16,24 @@ from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
 from .bench_murmur import best_by, binary_metrics, json_safe, sweep_thresholds
-from .dataset import CirCorRecordingMurmurDataset, window_hop_samples
+from .dataset import CirCorRecordingMurmurDataset, load_recording_teacher_targets, window_hop_samples
 from .model import count_parameters
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
 from .train import (
     LOSS_TYPES,
     _patient_labels,
-    aggregate_logits,
+    add_augmentation_args,
+    add_teacher_args,
+    apply_train_augmentation,
+    augmentation_config_from_args,
     build_loss_fn,
     build_model,
     device,
     positive_weighted_sampler,
+    recording_batch_logits,
     recording_collate,
     run_recording_epoch,
+    unpack_recording_batch,
 )
 
 log = logging.getLogger("cv_murmur")
@@ -67,6 +72,26 @@ def subset_balance(ds: CirCorRecordingMurmurDataset, indices: list[int]) -> dict
     return {"absent": absent, "present": present}
 
 
+def limit_patient_labels(
+    patient_labels: dict[int, int],
+    max_patients: int | None,
+    n_folds: int,
+    seed: int,
+) -> dict[int, int]:
+    if max_patients is None or max_patients <= 0 or max_patients >= len(patient_labels):
+        return patient_labels
+    if max_patients < n_folds * 2:
+        raise ValueError(f"max_patients must be at least {n_folds * 2} for {n_folds} stratified folds")
+    rng = np.random.default_rng(seed)
+    selected: dict[int, int] = {}
+    per_class = max(n_folds, max_patients // 2)
+    for label in (0, 1):
+        ids = sorted(pid for pid, y in patient_labels.items() if y == label)
+        rng.shuffle(ids)
+        selected.update({pid: label for pid in ids[: min(per_class, len(ids))]})
+    return selected
+
+
 def train_fold(
     args: argparse.Namespace,
     ds: CirCorRecordingMurmurDataset,
@@ -80,6 +105,10 @@ def train_fold(
     torch.manual_seed(args.seed + fold)
 
     train_ds = Subset(ds, train_idx)
+    if args.wide_features:
+        ds.fit_wide_normalization(train_idx)
+    train_augmentation = augmentation_config_from_args(args)
+    train_ds = apply_train_augmentation(train_ds, train_augmentation, args.seed + fold)
     val_ds = Subset(ds, val_idx)
     pin = dev.type in ("cuda",)
     sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed + fold)
@@ -103,7 +132,8 @@ def train_fold(
     )
 
     channels = feature_channels(args.feature_mode)
-    model = build_model(args.architecture, in_channels=channels).to(dev)
+    wide_feature_dim = ds.wide_feature_dim if args.wide_features else 0
+    model = build_model(args.architecture, in_channels=channels, wide_feature_dim=wide_feature_dim).to(dev)
     bal = subset_balance(ds, train_idx)
     pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1)) * args.pos_weight_multiplier
     pos_weight = torch.tensor([pos_weight_val], device=dev)
@@ -132,7 +162,15 @@ def train_fold(
     history: list[dict[str, float | int]] = []
     for epoch in range(1, args.epochs + 1):
         tr_loss, tr_auc = run_recording_epoch(
-            model, train_loader, loss_fn, opt, dev, args.aggregation, args.topk
+            model,
+            train_loader,
+            loss_fn,
+            opt,
+            dev,
+            args.aggregation,
+            args.topk,
+            args.grad_clip_norm,
+            teacher_distill_weight=args.teacher_distill_weight,
         )
         va_loss, va_auc = run_recording_epoch(
             model, val_loader, loss_fn, None, dev, args.aggregation, args.topk
@@ -215,6 +253,9 @@ def train_fold(
         "val_balance": subset_balance(ds, val_idx),
         "feature_mode": args.feature_mode,
         "input_channels": channels,
+        "wide_features": args.wide_features,
+        "wide_feature_dim": wide_feature_dim,
+        "wide_feature_names": list(ds.wide_feature_names) if args.wide_features else [],
         "architecture": args.architecture,
         "aggregation": args.aggregation,
         "topk": args.topk,
@@ -229,6 +270,15 @@ def train_fold(
         "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
         "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
         "positive_sample_weight": args.positive_sample_weight,
+        "grad_clip_norm": args.grad_clip_norm,
+        "teacher_predictions_csv": str(args.teacher_predictions_csv)
+        if args.teacher_predictions_csv is not None
+        else None,
+        "teacher_prob_column": args.teacher_prob_column,
+        "teacher_aggregation": args.teacher_aggregation,
+        "teacher_topk": args.teacher_topk,
+        "teacher_distill_weight": args.teacher_distill_weight,
+        "augmentation": train_augmentation.__dict__,
         "params": count_parameters(model),
     }
     (fold_dir / "best_meta.json").write_text(json.dumps(json_safe(meta), indent=2))
@@ -248,13 +298,18 @@ def predict_recordings(
 ) -> list[tuple[int, float]]:
     out: list[tuple[int, float]] = []
     with torch.no_grad():
-        for recordings, labels in loader:
-            for mel, label in zip(recordings, labels.tolist()):
-                mel = mel.to(dev, non_blocking=True)
-                logits = model(mel)
-                agg = aggregate_logits(logits, aggregation, topk)
-                prob = float(torch.sigmoid(agg).detach().cpu().item())
-                out.append((int(label), prob))
+        for batch in loader:
+            recordings, labels, wides, _teachers = unpack_recording_batch(batch, dev)
+            batch_logits = recording_batch_logits(
+                model,
+                recordings,
+                dev,
+                aggregation,
+                topk,
+                wides=wides,
+            )
+            probs = torch.sigmoid(batch_logits).detach().cpu().numpy().tolist()
+            out.extend((int(label), float(prob)) for label, prob in zip(labels.detach().cpu().tolist(), probs))
     return out
 
 
@@ -484,6 +539,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         hop_samples,
     )
 
+    teacher_targets = None
+    if args.teacher_predictions_csv is not None:
+        teacher_targets = load_recording_teacher_targets(
+            args.teacher_predictions_csv,
+            prob_column=args.teacher_prob_column,
+            aggregation=args.teacher_aggregation,
+            topk=args.teacher_topk,
+        )
     ds = CirCorRecordingMurmurDataset(
         args.data,
         apply_cardiac=not args.no_cardiac,
@@ -491,10 +554,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         window_seconds=args.window_seconds,
         hop_seconds=args.hop_seconds,
         cache_features=True,
+        include_wide_features=args.wide_features,
+        feature_cache_dir=args.feature_cache_dir,
+        teacher_targets=teacher_targets,
     )
-    patient_labels = _patient_labels([(pid, label) for pid, _loc, _wav, label in ds._records])
+    all_patient_labels = _patient_labels([(pid, label) for pid, _loc, _wav, label in ds._records])
+    patient_labels = limit_patient_labels(all_patient_labels, args.max_patients, args.folds, args.seed)
     folds = stratified_patient_folds(patient_labels, args.folds, args.seed)
-    log.info("dataset: %d recordings | balance: %s", len(ds), ds.class_balance())
+    selected_recordings = recording_indices_for_patients(ds, set(patient_labels))
+    log.info(
+        "dataset: %d recordings | selected=%d | balance: %s",
+        len(ds),
+        len(selected_recordings),
+        subset_balance(ds, selected_recordings),
+    )
+    if teacher_targets is not None:
+        log.info("teacher target coverage: %s", ds.teacher_target_coverage())
+    augmentation = augmentation_config_from_args(args)
+    if augmentation.enabled:
+        log.info("train-only augmentation: %s", augmentation)
 
     fold_reports: list[dict[str, object]] = []
     prediction_rows: list[dict[str, object]] = []
@@ -535,11 +613,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "data": str(args.data),
         "feature_mode": args.feature_mode,
         "architecture": args.architecture,
+        "wide_features": args.wide_features,
+        "wide_feature_dim": ds.wide_feature_dim,
+        "wide_feature_names": list(ds.wide_feature_names),
         "level": "recording",
         "aggregation": args.aggregation,
         "topk": args.topk,
         "folds": args.folds,
         "seed": args.seed,
+        "max_patients": args.max_patients,
+        "feature_cache_dir": str(args.feature_cache_dir) if args.feature_cache_dir is not None else None,
         "apply_cardiac": not args.no_cardiac,
         "window_seconds": args.window_seconds,
         "hop_seconds": args.hop_seconds_effective,
@@ -554,6 +637,18 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
         "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
         "positive_sample_weight": args.positive_sample_weight,
+        "grad_clip_norm": args.grad_clip_norm,
+        "teacher_predictions_csv": str(args.teacher_predictions_csv)
+        if args.teacher_predictions_csv is not None
+        else None,
+        "teacher_prob_column": args.teacher_prob_column,
+        "teacher_aggregation": args.teacher_aggregation,
+        "teacher_topk": args.teacher_topk,
+        "teacher_distill_weight": args.teacher_distill_weight,
+        "teacher_target_coverage": ds.teacher_target_coverage()
+        if teacher_targets is not None
+        else None,
+        "augmentation": augmentation_config_from_args(args).__dict__,
         "n_recordings": int(labels.size),
         "positives": int(labels.sum()),
         "fold_reports": fold_reports,
@@ -581,17 +676,34 @@ def main() -> None:
     p.add_argument("--data", type=Path, required=True, help="CirCor root")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--folds", type=int, default=5)
+    p.add_argument(
+        "--max-patients",
+        type=int,
+        default=None,
+        help="optional stratified patient subset for smoke runs; unset uses all patients",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--workers", type=int, default=0)
+    p.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        default=None,
+        help="optional on-disk recording feature cache for expensive feature modes",
+    )
     p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     p.add_argument(
         "--architecture",
-        choices=["cnn", "cnn_bigru", "scattering_cnn1d"],
+        choices=["cnn", "cnn_bigru", "scattering_cnn1d", "scattering_transformer"],
         default="cnn_bigru",
+    )
+    p.add_argument(
+        "--wide-features",
+        action="store_true",
+        help="add train-fold-normalized metadata/audio-stat branch; requires cnn_bigru",
     )
     p.add_argument("--feature-mode", choices=FEATURE_MODES, default=FEATURE_MODE_LOGMEL)
     p.add_argument("--window-seconds", type=float, default=5.0)
@@ -612,11 +724,21 @@ def main() -> None:
     p.add_argument("--early-stopping-patience", type=int, default=2)
     p.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     p.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help="clip gradient norm after backward; 0 disables",
+    )
+    p.add_argument(
         "--no-cardiac",
         action="store_true",
         help="skip legacy cardiac filter; matches current stetho-ui preprocessing",
     )
+    add_augmentation_args(p)
+    add_teacher_args(p)
     args = p.parse_args()
+    if args.wide_features and args.architecture != "cnn_bigru":
+        p.error("--wide-features currently requires --architecture cnn_bigru")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     print(json.dumps(json_safe(run(args)), indent=2))

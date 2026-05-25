@@ -34,12 +34,24 @@ F_MAX = (MEL_FFT_BINS - 1) * SAMPLE_RATE / N_FFT  # ≈ 1000 Hz
 LOG_FLOOR = 1e-10
 NORM_CLIP = -1.0  # = -80 dB / 80
 FEATURE_MODE_LOGMEL = "logmel"
+FEATURE_MODE_LOGMEL128 = "logmel128"
 FEATURE_MODE_MFCC = "mfcc"
 FEATURE_MODE_SCATTERING = "scattering"
 FEATURE_MODE_MULTI = "multi"
-FEATURE_MODES = (FEATURE_MODE_LOGMEL, FEATURE_MODE_MFCC, FEATURE_MODE_SCATTERING, FEATURE_MODE_MULTI)
+FEATURE_MODES = (
+    FEATURE_MODE_LOGMEL,
+    FEATURE_MODE_LOGMEL128,
+    FEATURE_MODE_MFCC,
+    FEATURE_MODE_SCATTERING,
+    FEATURE_MODE_MULTI,
+)
 SCATTERING_J = 8
 SCATTERING_Q = 4
+HEARHEART_N_FFT = 200       # 50 ms at 4 kHz
+HEARHEART_STFT_HOP = 100    # 25 ms at 4 kHz
+HEARHEART_N_MELS = 128
+HEARHEART_F_MIN = 25.0
+HEARHEART_F_MAX = 2000.0
 
 
 # ─── filters ────────────────────────────────────────────────────────────────
@@ -193,6 +205,31 @@ def _stft_magnitude(audio: np.ndarray) -> np.ndarray:
     return np.abs(np.fft.rfft(framed, n=N_FFT, axis=1))[:, :MEL_FFT_BINS].astype(np.float32, copy=False)
 
 
+def _stft_magnitude_custom(
+    audio: np.ndarray,
+    n_fft: int,
+    hop: int,
+    window: str = "hann",
+) -> np.ndarray:
+    """Overlapping STFT magnitude for research feature modes."""
+    if audio.ndim != 1:
+        raise ValueError("expected mono 1D input")
+    if len(audio) < n_fft:
+        return np.zeros((0, n_fft // 2 + 1), dtype=np.float32)
+    n_frames = 1 + (len(audio) - n_fft) // hop
+    starts = np.arange(n_frames) * hop
+    frames = np.stack([audio[start : start + n_fft] for start in starts], axis=0)
+    frames = frames - frames.mean(axis=1, keepdims=True)
+    if window == "hamming":
+        win = np.hamming(n_fft).astype(np.float32)
+    elif window == "hann":
+        win = np.hanning(n_fft).astype(np.float32)
+    else:
+        raise ValueError(f"unknown STFT window {window!r}")
+    framed = frames * win
+    return np.abs(np.fft.rfft(framed, n=n_fft, axis=1)).astype(np.float32, copy=False)
+
+
 def _normalize_feature_frames(x: np.ndarray) -> np.ndarray:
     """Per-frame z-score with the same lower clip used by log-mel."""
     mean = x.mean(axis=1, keepdims=True)
@@ -216,6 +253,44 @@ def log_mel(audio: np.ndarray) -> np.ndarray:
     """Compute the log-mel-spec for a single (already-filtered, 4 kHz mono)
     audio array. Returns `(n_frames, N_MELS)` float32."""
     return _normalize_feature_frames(_log_mel_db(audio))
+
+
+def log_mel128(audio: np.ndarray) -> np.ndarray:
+    """HearHeart-style 128-bin log-mel feature for research CV.
+
+    Uses 50 ms Hamming windows, 25 ms hop, and the full 25-2000 Hz band at
+    4 kHz. This intentionally does not match the deployed Rust mel path.
+    """
+    spec = _stft_magnitude_custom(
+        audio,
+        n_fft=HEARHEART_N_FFT,
+        hop=HEARHEART_STFT_HOP,
+        window="hamming",
+    )
+    if spec.shape[0] == 0:
+        return np.zeros((0, HEARHEART_N_MELS), dtype=np.float32)
+    key = (
+        SAMPLE_RATE,
+        HEARHEART_N_MELS,
+        HEARHEART_N_FFT,
+        spec.shape[1],
+        HEARHEART_F_MIN,
+        HEARHEART_F_MAX,
+    )
+    bank = _FILTERBANK_CACHE.get(key)
+    if bank is None:
+        bank = mel_filterbank(
+            sample_rate=SAMPLE_RATE,
+            n_mels=HEARHEART_N_MELS,
+            n_fft=HEARHEART_N_FFT,
+            mel_fft_bins=spec.shape[1],
+            f_min=HEARHEART_F_MIN,
+            f_max=HEARHEART_F_MAX,
+        )
+        _FILTERBANK_CACHE[key] = bank
+    mel = spec @ bank.T
+    log_mel_db = (10.0 * np.log10(np.maximum(mel, LOG_FLOOR))).astype(np.float32, copy=False)
+    return _normalize_feature_frames(log_mel_db)
 
 
 def mfcc(audio: np.ndarray) -> np.ndarray:
@@ -277,7 +352,7 @@ def scattering_features(audio: np.ndarray) -> np.ndarray:
 
 
 def feature_channels(mode: str) -> int:
-    if mode in (FEATURE_MODE_LOGMEL, FEATURE_MODE_MFCC, FEATURE_MODE_SCATTERING):
+    if mode in (FEATURE_MODE_LOGMEL, FEATURE_MODE_LOGMEL128, FEATURE_MODE_MFCC, FEATURE_MODE_SCATTERING):
         return 1
     if mode == FEATURE_MODE_MULTI:
         return 3
@@ -288,12 +363,15 @@ def window_features(audio: np.ndarray, mode: str = FEATURE_MODE_LOGMEL) -> np.nd
     """Return model features for one window.
 
     `logmel` returns `(T, N_MELS)` to preserve the existing production path.
+    `logmel128` returns `(T, 128)` for the HearHeart-style research path.
     `mfcc` returns `(T, N_MELS)` for a single-channel MFCC-only experiment.
     `scattering` returns `(T, C)` wavelet-scattering coefficients.
     `multi` returns `(3, T, N_MELS)` with log-mel, MFCC, and log-STFT energy.
     """
     if mode == FEATURE_MODE_LOGMEL:
         return log_mel(audio)
+    if mode == FEATURE_MODE_LOGMEL128:
+        return log_mel128(audio)
     if mode == FEATURE_MODE_MFCC:
         return mfcc(audio)
     if mode == FEATURE_MODE_SCATTERING:

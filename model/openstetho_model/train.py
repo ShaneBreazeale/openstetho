@@ -19,26 +19,142 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
-from .dataset import CirCorMurmurDataset, CirCorRecordingMurmurDataset, window_hop_samples
-from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D, count_parameters
+from .dataset import (
+    CirCorMurmurDataset,
+    CirCorRecordingMurmurDataset,
+    MurmurAugmentationConfig,
+    load_recording_teacher_targets,
+    window_hop_samples,
+)
+from .model import (
+    MurmurCNN,
+    MurmurCNNBiGRU,
+    MurmurScatteringCNN1D,
+    MurmurScatteringTransformer,
+    count_parameters,
+)
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
 
 log = logging.getLogger("train")
 LOSS_TYPES = ("bce", "focal_bce", "asymmetric_focal")
+LOSS_LOGIT_CLIP = 30.0
 
 
-def build_model(architecture: str, in_channels: int = 1) -> nn.Module:
+def build_model(architecture: str, in_channels: int = 1, wide_feature_dim: int = 0) -> nn.Module:
+    if wide_feature_dim > 0 and architecture != "cnn_bigru":
+        raise ValueError("wide features are currently supported only for architecture='cnn_bigru'")
     if architecture == "cnn":
         return MurmurCNN(in_channels=in_channels)
     if architecture == "cnn_bigru":
-        return MurmurCNNBiGRU(in_channels=in_channels)
+        return MurmurCNNBiGRU(in_channels=in_channels, wide_feature_dim=wide_feature_dim)
     if architecture == "scattering_cnn1d":
         return MurmurScatteringCNN1D()
+    if architecture == "scattering_transformer":
+        return MurmurScatteringTransformer()
     raise ValueError(f"unknown architecture {architecture}")
+
+
+def add_augmentation_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--audio-noise-snr-db",
+        type=float,
+        default=None,
+        help="train-only Gaussian noise SNR in dB; unset disables audio noise",
+    )
+    p.add_argument(
+        "--audio-noise-prob",
+        type=float,
+        default=0.0,
+        help="probability of applying train-only audio noise",
+    )
+    p.add_argument(
+        "--train-random-crop",
+        action="store_true",
+        help="for recording-level training, use one random window per recording; validation remains overlapped",
+    )
+    p.add_argument(
+        "--window-jitter-seconds",
+        type=float,
+        default=0.0,
+        help="train-only random jitter for fixed window/crop start times",
+    )
+    p.add_argument(
+        "--time-shift-seconds",
+        type=float,
+        default=0.0,
+        help="train-only circular time-shift jitter in seconds",
+    )
+    p.add_argument(
+        "--time-shift-prob",
+        type=float,
+        default=0.0,
+        help="probability of applying train-only time shift",
+    )
+    p.add_argument(
+        "--freq-mask-max-width",
+        type=int,
+        default=0,
+        help="train-only SpecAugment frequency-mask max width in feature bins",
+    )
+    p.add_argument(
+        "--time-mask-max-width",
+        type=int,
+        default=0,
+        help="train-only SpecAugment time-mask max width in frames",
+    )
+
+
+def add_teacher_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--teacher-predictions-csv",
+        type=Path,
+        default=None,
+        help="optional per-window teacher predictions CSV for recording-level soft-target training",
+    )
+    p.add_argument(
+        "--teacher-prob-column",
+        default="onnx_prob",
+        help="teacher probability column in --teacher-predictions-csv",
+    )
+    p.add_argument(
+        "--teacher-aggregation",
+        choices=["mean", "max", "topk_mean"],
+        default="max",
+        help="aggregate per-window teacher probabilities to a recording-level soft target",
+    )
+    p.add_argument("--teacher-topk", type=int, default=3)
+    p.add_argument(
+        "--teacher-distill-weight",
+        type=float,
+        default=0.0,
+        help="extra BCE weight for finite recording-level teacher soft targets; 0 disables",
+    )
+
+
+def augmentation_config_from_args(args: argparse.Namespace) -> MurmurAugmentationConfig:
+    return MurmurAugmentationConfig(
+        audio_noise_snr_db=args.audio_noise_snr_db,
+        audio_noise_prob=args.audio_noise_prob,
+        random_crop=args.train_random_crop,
+        window_jitter_seconds=args.window_jitter_seconds,
+        time_shift_seconds=args.time_shift_seconds,
+        time_shift_prob=args.time_shift_prob,
+        freq_mask_max_width=args.freq_mask_max_width,
+        time_mask_max_width=args.time_mask_max_width,
+    )
+
+
+def apply_train_augmentation(dataset, config: MurmurAugmentationConfig, seed: int):
+    if not config.enabled:
+        return dataset
+    if isinstance(dataset, Subset) and hasattr(dataset.dataset, "with_augmentation"):
+        return Subset(dataset.dataset.with_augmentation(config, seed), dataset.indices)
+    if hasattr(dataset, "with_augmentation"):
+        return dataset.with_augmentation(config, seed)
+    return dataset
 
 
 class FocalBCEWithLogitsLoss(nn.Module):
@@ -48,13 +164,9 @@ class FocalBCEWithLogitsLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logits = logits.clamp(-LOSS_LOGIT_CLIP, LOSS_LOGIT_CLIP)
         labels = labels.float()
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            labels,
-            pos_weight=self.pos_weight,
-            reduction="none",
-        )
+        bce = stable_bce_with_logits(logits, labels, self.pos_weight)
         probs = torch.sigmoid(logits)
         pt = torch.where(labels == 1, probs, 1.0 - probs)
         return (((1.0 - pt).clamp_min(1e-6) ** self.gamma) * bce).mean()
@@ -73,13 +185,9 @@ class AsymmetricFocalBCEWithLogitsLoss(nn.Module):
         self.gamma_neg = gamma_neg
 
     def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logits = logits.clamp(-LOSS_LOGIT_CLIP, LOSS_LOGIT_CLIP)
         labels = labels.float()
-        bce = F.binary_cross_entropy_with_logits(
-            logits,
-            labels,
-            pos_weight=self.pos_weight,
-            reduction="none",
-        )
+        bce = stable_bce_with_logits(logits, labels, self.pos_weight)
         probs = torch.sigmoid(logits)
         pt = torch.where(labels == 1, probs, 1.0 - probs)
         gamma = torch.where(
@@ -98,7 +206,7 @@ def build_loss_fn(
     asymmetric_gamma_neg: float = 2.0,
 ) -> nn.Module:
     if loss == "bce":
-        return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        return StableBCEWithLogitsLoss(pos_weight=pos_weight)
     if loss == "focal_bce":
         return FocalBCEWithLogitsLoss(pos_weight=pos_weight, gamma=focal_gamma)
     if loss == "asymmetric_focal":
@@ -108,6 +216,30 @@ def build_loss_fn(
             gamma_neg=asymmetric_gamma_neg,
         )
     raise ValueError(f"unknown loss {loss!r}; valid: {LOSS_TYPES}")
+
+
+class StableBCEWithLogitsLoss(nn.Module):
+    """BCEWithLogits with defensive logit clipping for long-window MPS runs."""
+
+    def __init__(self, pos_weight: torch.Tensor):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight)
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        logits = logits.clamp(-LOSS_LOGIT_CLIP, LOSS_LOGIT_CLIP)
+        return stable_bce_with_logits(logits, labels.float(), self.pos_weight).mean()
+
+
+def stable_bce_with_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    pos_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Numerically stable BCE-with-logits formula with positive weighting."""
+    max_val = (-logits).clamp_min(0)
+    log_weight = 1.0 + (pos_weight - 1.0) * labels
+    log_exp = torch.log(torch.exp(-max_val) + torch.exp(-logits - max_val))
+    return (1.0 - labels) * logits + log_weight * (max_val + log_exp)
 
 
 def labels_for_dataset(dataset) -> list[int]:
@@ -202,10 +334,49 @@ def recording_patient_split(
     return Subset(ds, train_idx), Subset(ds, val_idx)
 
 
-def recording_collate(batch: list[tuple[torch.Tensor, int]]) -> tuple[list[torch.Tensor], torch.Tensor]:
-    recordings = [mel for mel, _ in batch]
-    labels = torch.tensor([label for _, label in batch], dtype=torch.float32)
+def recording_collate(batch):
+    if len(batch[0]) == 4:
+        recordings = [mel for mel, _wide, _teacher, _label in batch]
+        wides = torch.stack([wide for _mel, wide, _teacher, _label in batch])
+        teachers = torch.stack([teacher for _mel, _wide, teacher, _label in batch])
+        labels = torch.tensor([label for _mel, _wide, _teacher, label in batch], dtype=torch.float32)
+        return recordings, wides, teachers, labels
+    if len(batch[0]) == 3 and torch.as_tensor(batch[0][1]).ndim > 0:
+        recordings = [mel for mel, _wide, _label in batch]
+        wides = torch.stack([wide for _mel, wide, _label in batch])
+        labels = torch.tensor([label for _mel, _wide, label in batch], dtype=torch.float32)
+        return recordings, wides, labels
+    if len(batch[0]) == 3:
+        recordings = [mel for mel, _teacher, _label in batch]
+        teachers = torch.stack([teacher for _mel, teacher, _label in batch])
+        labels = torch.tensor([label for _mel, _teacher, label in batch], dtype=torch.float32)
+        return recordings, teachers, labels
+    recordings = [mel for mel, _label in batch]
+    labels = torch.tensor([label for _mel, label in batch], dtype=torch.float32)
     return recordings, labels
+
+
+def unpack_recording_batch(
+    batch,
+    dev: torch.device,
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    if len(batch) == 4:
+        recordings, wides, teachers, labels = batch
+        return (
+            recordings,
+            labels.to(dev, non_blocking=True),
+            wides.to(dev, non_blocking=True),
+            teachers.to(dev, non_blocking=True),
+        )
+    if len(batch) == 3:
+        recordings, aux, labels = batch
+        aux = aux.to(dev, non_blocking=True)
+        labels = labels.to(dev, non_blocking=True)
+        if aux.ndim == 1:
+            return recordings, labels, None, aux
+        return recordings, labels, aux, None
+    recordings, labels = batch
+    return recordings, labels.to(dev, non_blocking=True), None, None
 
 
 def aggregate_logits(logits: torch.Tensor, mode: str, topk: int) -> torch.Tensor:
@@ -221,18 +392,48 @@ def aggregate_logits(logits: torch.Tensor, mode: str, topk: int) -> torch.Tensor
     raise ValueError(f"unknown aggregation mode {mode}")
 
 
+def recording_batch_logits(
+    model: nn.Module,
+    recordings: list[torch.Tensor],
+    dev: torch.device,
+    aggregation: str,
+    topk: int,
+    wides: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score a variable-window recording batch with one model call.
+
+    `recording_collate` keeps recordings as a list because each recording can
+    have a different number of windows. Concatenating all windows avoids one
+    model invocation per recording, then `split` restores recording boundaries
+    before mean/max/top-k aggregation.
+    """
+    counts = [int(mel.shape[0]) for mel in recordings]
+    if any(count <= 0 for count in counts):
+        raise ValueError(f"recording batch contains an empty recording: {counts}")
+    all_windows = torch.cat([mel.to(dev, non_blocking=True) for mel in recordings], dim=0)
+    if wides is None:
+        window_logits = model(all_windows)
+    else:
+        repeated_wides = torch.repeat_interleave(wides, torch.tensor(counts, device=wides.device), dim=0)
+        window_logits = model(all_windows, repeated_wides)
+    per_recording = torch.split(window_logits.reshape(-1), counts)
+    return torch.stack([aggregate_logits(logits, aggregation, topk) for logits in per_recording])
+
+
 def run_epoch(
     model: nn.Module,
     loader: Iterable,
     loss_fn: nn.Module,
     opt: torch.optim.Optimizer | None,
     dev: torch.device,
+    grad_clip_norm: float = 0.0,
 ) -> tuple[float, float]:
     model.train(opt is not None)
     losses: list[float] = []
     probs: list[float] = []
     labels: list[float] = []
     for mel, label in loader:
+        batch_labels = [int(round(x)) for x in label.numpy().tolist()]
         mel = mel.to(dev, non_blocking=True)
         label = label.to(dev, non_blocking=True).float()
         with torch.set_grad_enabled(opt is not None):
@@ -241,10 +442,12 @@ def run_epoch(
             if opt is not None:
                 opt.zero_grad()
                 loss.backward()
+                if grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 opt.step()
         losses.append(loss.item())
         probs.extend(torch.sigmoid(logit).detach().cpu().numpy().tolist())
-        labels.extend(label.detach().cpu().numpy().tolist())
+        labels.extend(batch_labels)
     auc = float("nan")
     if len(set(labels)) == 2:
         auc = roc_auc_score(labels, probs)
@@ -259,28 +462,49 @@ def run_recording_epoch(
     dev: torch.device,
     aggregation: str,
     topk: int,
+    grad_clip_norm: float = 0.0,
+    teacher_distill_weight: float = 0.0,
 ) -> tuple[float, float]:
     model.train(opt is not None)
     losses: list[float] = []
     probs: list[float] = []
     labels_out: list[float] = []
-    for recordings, labels in loader:
-        labels = labels.to(dev, non_blocking=True)
-        agg_logits: list[torch.Tensor] = []
+    teacher_pos_weight = torch.tensor([1.0], device=dev)
+    for batch in loader:
+        recordings, labels, wides, teachers = unpack_recording_batch(batch, dev)
+        batch_labels = [int(round(x)) for x in labels.detach().cpu().numpy().tolist()]
         with torch.set_grad_enabled(opt is not None):
-            for mel in recordings:
-                mel = mel.to(dev, non_blocking=True)
-                logits = model(mel)
-                agg_logits.append(aggregate_logits(logits, aggregation, topk))
-            batch_logits = torch.stack(agg_logits)
+            batch_logits = recording_batch_logits(
+                model,
+                recordings,
+                dev,
+                aggregation,
+                topk,
+                wides=wides,
+            )
             loss = loss_fn(batch_logits, labels)
+            if (
+                opt is not None
+                and teacher_distill_weight > 0.0
+                and teachers is not None
+            ):
+                mask = torch.isfinite(teachers)
+                if mask.any():
+                    teacher_loss = stable_bce_with_logits(
+                        batch_logits[mask],
+                        teachers[mask],
+                        teacher_pos_weight,
+                    ).mean()
+                    loss = loss + teacher_distill_weight * teacher_loss
             if opt is not None:
                 opt.zero_grad()
                 loss.backward()
+                if grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
                 opt.step()
         losses.append(loss.item())
         probs.extend(torch.sigmoid(batch_logits).detach().cpu().numpy().tolist())
-        labels_out.extend(labels.detach().cpu().numpy().tolist())
+        labels_out.extend(batch_labels)
     auc = float("nan")
     if len(set(labels_out)) == 2:
         auc = roc_auc_score(labels_out, probs)
@@ -294,6 +518,12 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        default=None,
+        help="optional on-disk recording feature cache for expensive feature modes",
+    )
     p.add_argument("--out", type=Path, default=Path("runs/last"))
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
@@ -306,7 +536,16 @@ def main():
     )
     p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     p.add_argument("--level", choices=["window", "recording"], default="window")
-    p.add_argument("--architecture", choices=["cnn", "cnn_bigru", "scattering_cnn1d"], default="cnn")
+    p.add_argument(
+        "--architecture",
+        choices=["cnn", "cnn_bigru", "scattering_cnn1d", "scattering_transformer"],
+        default="cnn",
+    )
+    p.add_argument(
+        "--wide-features",
+        action="store_true",
+        help="add recording-level metadata/audio-stat feature branch; requires --level recording and cnn_bigru",
+    )
     p.add_argument(
         "--feature-mode",
         choices=FEATURE_MODES,
@@ -347,11 +586,25 @@ def main():
     )
     p.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     p.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=0.0,
+        help="clip gradient norm after backward; 0 disables",
+    )
+    p.add_argument(
         "--no-cardiac",
         action="store_true",
         help="skip legacy cardiac filter; matches current stetho-ui preprocessing",
     )
+    add_augmentation_args(p)
+    add_teacher_args(p)
     args = p.parse_args()
+    if args.wide_features and args.level != "recording":
+        p.error("--wide-features requires --level recording")
+    if args.wide_features and args.architecture != "cnn_bigru":
+        p.error("--wide-features currently requires --architecture cnn_bigru")
+    if args.teacher_predictions_csv is not None and args.level != "recording":
+        p.error("--teacher-predictions-csv requires --level recording")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args.out.mkdir(parents=True, exist_ok=True)
@@ -365,15 +618,30 @@ def main():
              args.window_seconds, window_samples, hop_seconds, hop_samples)
 
     if args.level == "recording":
+        teacher_targets = None
+        if args.teacher_predictions_csv is not None:
+            teacher_targets = load_recording_teacher_targets(
+                args.teacher_predictions_csv,
+                prob_column=args.teacher_prob_column,
+                aggregation=args.teacher_aggregation,
+                topk=args.teacher_topk,
+            )
         ds = CirCorRecordingMurmurDataset(
             args.data,
             apply_cardiac=not args.no_cardiac,
             feature_mode=args.feature_mode,
             window_seconds=args.window_seconds,
             hop_seconds=args.hop_seconds,
+            include_wide_features=args.wide_features,
+            feature_cache_dir=args.feature_cache_dir,
+            teacher_targets=teacher_targets,
         )
         log.info("dataset: %d recordings | balance: %s", len(ds), ds.class_balance())
+        if teacher_targets is not None:
+            log.info("teacher target coverage: %s", ds.teacher_target_coverage())
         train_ds, val_ds = recording_patient_split(ds, args.val_fraction, args.seed)
+        if args.wide_features:
+            ds.fit_wide_normalization(list(train_ds.indices))
         log.info(
             "split:  train=%d  val=%d  aggregation=%s topk=%d",
             len(train_ds),
@@ -392,6 +660,11 @@ def main():
         log.info("dataset: %d windows | balance: %s", len(ds), ds.class_balance())
         train_ds, val_ds = patient_split(ds, args.val_fraction, args.seed)
         log.info("split:  train=%d  val=%d", len(train_ds), len(val_ds))
+
+    augmentation = augmentation_config_from_args(args)
+    train_ds = apply_train_augmentation(train_ds, augmentation, args.seed)
+    if augmentation.enabled:
+        log.info("train-only augmentation: %s", augmentation)
 
     pin = dev.type in ("cuda",)
     sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed)
@@ -426,7 +699,8 @@ def main():
         )
 
     channels = feature_channels(args.feature_mode)
-    model = build_model(args.architecture, in_channels=channels).to(dev)
+    wide_feature_dim = ds.wide_feature_dim if args.level == "recording" and args.wide_features else 0
+    model = build_model(args.architecture, in_channels=channels, wide_feature_dim=wide_feature_dim).to(dev)
     log.info("features: %s channels=%d | params: %d", args.feature_mode, channels, count_parameters(model))
     # Class-balanced loss: pos_weight = N_neg / N_pos so the minority
     # (murmur-present) class gets a proportional gradient pull.
@@ -463,13 +737,21 @@ def main():
     for epoch in range(1, args.epochs + 1):
         if args.level == "recording":
             tr_loss, tr_auc = run_recording_epoch(
-                model, train_loader, loss_fn, opt, dev, args.aggregation, args.topk
+                model,
+                train_loader,
+                loss_fn,
+                opt,
+                dev,
+                args.aggregation,
+                args.topk,
+                args.grad_clip_norm,
+                teacher_distill_weight=args.teacher_distill_weight,
             )
             va_loss, va_auc = run_recording_epoch(
                 model, val_loader, loss_fn, None, dev, args.aggregation, args.topk
             )
         else:
-            tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev)
+            tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev, args.grad_clip_norm)
             va_loss, va_auc = run_epoch(model, val_loader, loss_fn, None, dev)
         lr_now = float(opt.param_groups[0]["lr"])
         history.append({
@@ -497,6 +779,14 @@ def main():
                 "architecture": args.architecture,
                 "feature_mode": args.feature_mode,
                 "input_channels": channels,
+                "wide_features": args.wide_features,
+                "wide_feature_dim": wide_feature_dim,
+                "wide_feature_names": list(ds.wide_feature_names)
+                if args.level == "recording" and args.wide_features
+                else [],
+                "feature_cache_dir": str(args.feature_cache_dir)
+                if args.feature_cache_dir is not None
+                else None,
                 "window_seconds": args.window_seconds,
                 "hop_seconds": hop_seconds,
                 "lr_scheduler": args.lr_scheduler,
@@ -508,6 +798,15 @@ def main():
                 "asymmetric_gamma_pos": args.asymmetric_gamma_pos,
                 "asymmetric_gamma_neg": args.asymmetric_gamma_neg,
                 "positive_sample_weight": args.positive_sample_weight,
+                "grad_clip_norm": args.grad_clip_norm,
+                "teacher_predictions_csv": str(args.teacher_predictions_csv)
+                if args.teacher_predictions_csv is not None
+                else None,
+                "teacher_prob_column": args.teacher_prob_column,
+                "teacher_aggregation": args.teacher_aggregation,
+                "teacher_topk": args.teacher_topk,
+                "teacher_distill_weight": args.teacher_distill_weight,
+                "augmentation": augmentation.__dict__,
                 "aggregation": args.aggregation if args.level == "recording" else None,
                 "topk": args.topk if args.level == "recording" else None,
             }))
