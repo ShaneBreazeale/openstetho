@@ -107,6 +107,41 @@ uv run --project model python -m openstetho_model.train \
     --out model/runs/murmur_cnn_bigru_mean_full_v1
 ```
 
+The research path supports alternate feature and window experiments:
+
+- `--feature-mode mfcc`: single-channel MFCC-only input
+- `--feature-mode multi`: stacked log-mel, MFCC, and log-STFT energy maps
+- `--feature-mode scattering`: wavelet-scattering coefficients for the
+  PyTorch-only `scattering_cnn1d` architecture
+- `--architecture scattering_cnn1d`: small 1D-CNN for scattering features
+- `--window-seconds 5`: 5-second windows with 50 percent overlap by default
+- `--lr-scheduler plateau`: validation-AUC `ReduceLROnPlateau`
+- `--early-stopping-patience N`: stop after N non-improving validation epochs
+
+This is intentionally limited to PyTorch training/benchmarking for now.
+The first full-CirCor 5-second MFCC-only CNN+BiGRU run improved best-F1
+over the released 4-second log-mel checkpoint; the stacked multi-channel
+run trailed both. Follow-up 5-fold patient-level CV is available with
+`openstetho_model.cv_murmur`; it showed MFCC had stronger mean fold AUROC
+but weaker pooled out-of-fold calibration than 5-second log-mel. The
+initial wavelet-scattering + 1D-CNN run was a negative result in this
+pipeline, with pooled out-of-fold AUROC near chance, so keep it as a
+research branch rather than a model candidate.
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --feature-mode mfcc \
+    --window-seconds 5 \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --no-cardiac \
+    --out model/runs/murmur_cv_mfcc_5s_v1
+```
+
 ## Murmur benchmark
 
 Use `bench_murmur` to compare the current exported murmur detector against
@@ -155,7 +190,8 @@ uv run --project model python -m openstetho_model.bench_murmur \
 ```
 
 See `docs/murmur_detector_benchmark.md` for the latest Core ML, vote-rule,
-bandpass, and CNN+BiGRU results.
+bandpass, CNN+BiGRU, multi-channel feature, MFCC CV, and scattering CV
+results.
 
 Current app-facing post-processing tune for the exported `MurmurCNN`: use
 recording-level mean aggregation and threshold at `0.49331352`. This is the

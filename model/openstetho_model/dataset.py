@@ -30,11 +30,13 @@ import torch
 from torch.utils.data import Dataset
 
 from .preprocess import (
-    WINDOW_SAMPLES,
+    FEATURE_MODE_LOGMEL,
+    HOP_FRACTION,
+    SAMPLE_RATE,
     apply_cardiac,
     load_audio,
-    log_mel,
     split_windows,
+    window_features,
 )
 
 log = logging.getLogger(__name__)
@@ -42,11 +44,21 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class CirCorSample:
-    """One 4-second window with a label."""
+    """One fixed-length window with a label."""
     patient_id: int
     location: str
     label: int       # 0 = Absent, 1 = Present
-    audio: np.ndarray  # (WINDOW_SAMPLES,) float32, cardiac-filtered, 4 kHz
+    audio: np.ndarray  # float32, cardiac-filtered, 4 kHz
+
+
+def window_hop_samples(window_seconds: float, hop_seconds: float | None = None) -> tuple[int, int]:
+    if window_seconds <= 0:
+        raise ValueError("window_seconds must be positive")
+    if hop_seconds is None:
+        hop_seconds = window_seconds * HOP_FRACTION
+    if hop_seconds <= 0:
+        raise ValueError("hop_seconds must be positive")
+    return int(round(window_seconds * SAMPLE_RATE)), int(round(hop_seconds * SAMPLE_RATE))
 
 
 def _load_metadata(csv_path: Path) -> pd.DataFrame:
@@ -78,8 +90,9 @@ def _patient_recordings(root: Path, patient_id: int, locations: str) -> list[tup
 class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
     """Binary murmur-present-vs-absent classifier dataset.
 
-    Each `__getitem__` returns one preprocessed 4-second window:
+    Each `__getitem__` returns one preprocessed fixed-length window:
         mel: torch.Tensor (n_frames, N_MELS)  — log-mel spectrogram
+             or (3, n_frames, N_MELS) in multi-channel research mode
         label: int                            — 0 absent, 1 present
     """
 
@@ -89,12 +102,17 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
         patient_ids: Sequence[int] | None = None,
         apply_cardiac: bool = True,
         profile_fir_path: str | Path | None = None,
+        feature_mode: str = FEATURE_MODE_LOGMEL,
+        window_seconds: float = 4.0,
+        hop_seconds: float | None = None,
     ):
         self.root = Path(root)
+        self.window_samples, self.hop_samples = window_hop_samples(window_seconds, hop_seconds)
         # When False, audio goes straight to mel-spec with no biquad chain.
         # Matches the stetho-ui inference path which now also runs the model
         # on raw audio so training and deployment share the same preprocess.
         self.apply_cardiac_filter = apply_cardiac
+        self.feature_mode = feature_mode
 
         # Optional spectral-profile FIR — convolves each loaded clip with
         # a 256-tap filter that shifts CirCor's mean magnitude spectrum
@@ -124,7 +142,7 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
                 except Exception as e:  # noqa: BLE001
                     log.warning("skip %s: %s", wav, e)
                     continue
-                n_windows = max(0, 1 + (audio_len - WINDOW_SAMPLES) // (WINDOW_SAMPLES // 2))
+                n_windows = max(0, 1 + (audio_len - self.window_samples) // self.hop_samples)
                 for w in range(n_windows):
                     self._index.append((int(row["Patient ID"]), loc, wav, label, w))
 
@@ -146,11 +164,11 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
             audio = sps.lfilter(self._profile_fir, [1.0], audio).astype(np.float32)
         if self.apply_cardiac_filter:
             audio = apply_cardiac(audio)
-        windows = split_windows(audio)
+        windows = split_windows(audio, self.window_samples, self.hop_samples)
         if w_idx >= len(windows):
             # Length estimate was off; clamp to last window.
             w_idx = len(windows) - 1
-        mel = log_mel(windows[w_idx])
+        mel = window_features(windows[w_idx], self.feature_mode)
         return torch.from_numpy(mel), label
 
     def class_balance(self) -> dict[str, int]:
@@ -162,8 +180,9 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
 class CirCorRecordingMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
     """Recording-level murmur dataset.
 
-    Each item is all 4-second windows from one recording:
+    Each item is all fixed-length windows from one recording:
         mels: torch.Tensor (n_windows, n_frames, N_MELS)
+              or (n_windows, 3, n_frames, N_MELS) in multi-channel mode
         label: int
 
     This supports multiple-instance learning where the model scores every
@@ -176,9 +195,17 @@ class CirCorRecordingMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
         patient_ids: Sequence[int] | None = None,
         apply_cardiac: bool = True,
         profile_fir_path: str | Path | None = None,
+        feature_mode: str = FEATURE_MODE_LOGMEL,
+        window_seconds: float = 4.0,
+        hop_seconds: float | None = None,
+        cache_features: bool = False,
     ):
         self.root = Path(root)
+        self.window_samples, self.hop_samples = window_hop_samples(window_seconds, hop_seconds)
         self.apply_cardiac_filter = apply_cardiac
+        self.feature_mode = feature_mode
+        self.cache_features = cache_features
+        self._feature_cache: dict[int, torch.Tensor] = {}
         self._profile_fir: np.ndarray | None = None
         if profile_fir_path is not None:
             import json
@@ -210,20 +237,25 @@ class CirCorRecordingMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         _patient_id, _loc, wav, label = self._records[idx]
+        if self.cache_features and idx in self._feature_cache:
+            return self._feature_cache[idx], label
         audio = load_audio(str(wav))
         if self._profile_fir is not None:
             import scipy.signal as sps
             audio = sps.lfilter(self._profile_fir, [1.0], audio).astype(np.float32)
         if self.apply_cardiac_filter:
             audio = apply_cardiac(audio)
-        windows = split_windows(audio)
+        windows = split_windows(audio, self.window_samples, self.hop_samples)
         if len(windows) == 0:
             # Keep the model path defined for very short clips.
-            padded = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
-            padded[: min(len(audio), WINDOW_SAMPLES)] = audio[:WINDOW_SAMPLES]
+            padded = np.zeros(self.window_samples, dtype=np.float32)
+            padded[: min(len(audio), self.window_samples)] = audio[: self.window_samples]
             windows = np.expand_dims(padded, axis=0)
-        mels = np.stack([log_mel(w) for w in windows], axis=0)
-        return torch.from_numpy(mels), label
+        mels = np.stack([window_features(w, self.feature_mode) for w in windows], axis=0)
+        tensor = torch.from_numpy(mels)
+        if self.cache_features:
+            self._feature_cache[idx] = tensor
+        return tensor, label
 
     def class_balance(self) -> dict[str, int]:
         absent = sum(1 for *_, label in self._records if label == 0)
@@ -231,4 +263,9 @@ class CirCorRecordingMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
         return {"absent": absent, "present": present}
 
 
-__all__ = ["CirCorMurmurDataset", "CirCorRecordingMurmurDataset", "CirCorSample"]
+__all__ = [
+    "CirCorMurmurDataset",
+    "CirCorRecordingMurmurDataset",
+    "CirCorSample",
+    "window_hop_samples",
+]

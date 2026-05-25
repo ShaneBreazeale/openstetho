@@ -15,6 +15,7 @@ The mel filterbank is regenerated from Slaney's standard formula
 from __future__ import annotations
 
 import numpy as np
+import scipy.fft as spfft
 import scipy.signal as sps
 import soundfile as sf
 
@@ -32,6 +33,13 @@ F_MIN = 20.0
 F_MAX = (MEL_FFT_BINS - 1) * SAMPLE_RATE / N_FFT  # ≈ 1000 Hz
 LOG_FLOOR = 1e-10
 NORM_CLIP = -1.0  # = -80 dB / 80
+FEATURE_MODE_LOGMEL = "logmel"
+FEATURE_MODE_MFCC = "mfcc"
+FEATURE_MODE_SCATTERING = "scattering"
+FEATURE_MODE_MULTI = "multi"
+FEATURE_MODES = (FEATURE_MODE_LOGMEL, FEATURE_MODE_MFCC, FEATURE_MODE_SCATTERING, FEATURE_MODE_MULTI)
+SCATTERING_J = 8
+SCATTERING_Q = 4
 
 
 # ─── filters ────────────────────────────────────────────────────────────────
@@ -150,6 +158,7 @@ def mel_filterbank(
 
 
 _FILTERBANK_CACHE: dict[tuple, np.ndarray] = {}
+_SCATTERING_CACHE: dict[tuple[int, int, int], object] = {}
 
 
 def _get_filterbank() -> np.ndarray:
@@ -161,16 +170,15 @@ def _get_filterbank() -> np.ndarray:
     return bank
 
 
-def log_mel(audio: np.ndarray) -> np.ndarray:
-    """Compute the log-mel-spec for a single (already-filtered, 4 kHz mono)
-    audio array. Returns `(n_frames, N_MELS)` float32."""
+def _stft_magnitude(audio: np.ndarray) -> np.ndarray:
+    """Frame audio and return lower STFT magnitudes, shape `(T, MEL_FFT_BINS)`."""
     if audio.ndim != 1:
         raise ValueError("expected mono 1D input")
 
     # Frame into N_FFT-length blocks with hop=STFT_HOP (no overlap).
     n = (len(audio) // STFT_HOP) * STFT_HOP
     if n == 0:
-        return np.zeros((0, N_MELS), dtype=np.float32)
+        return np.zeros((0, MEL_FFT_BINS), dtype=np.float32)
     audio = audio[:n]
     frames = audio.reshape(-1, STFT_HOP)  # (T, N_FFT) when HOP == N_FFT
 
@@ -182,21 +190,117 @@ def log_mel(audio: np.ndarray) -> np.ndarray:
     framed = frames * win
 
     # rFFT magnitude, keep lower MEL_FFT_BINS bins.
-    spec = np.abs(np.fft.rfft(framed, n=N_FFT, axis=1))[:, :MEL_FFT_BINS]
+    return np.abs(np.fft.rfft(framed, n=N_FFT, axis=1))[:, :MEL_FFT_BINS].astype(np.float32, copy=False)
 
-    # Mel matmul.
+
+def _normalize_feature_frames(x: np.ndarray) -> np.ndarray:
+    """Per-frame z-score with the same lower clip used by log-mel."""
+    mean = x.mean(axis=1, keepdims=True)
+    std = x.std(axis=1, keepdims=True).clip(min=1e-9)
+    x = (x - mean) / std
+    x = np.clip(x, NORM_CLIP, None)
+    return x.astype(np.float32, copy=False)
+
+
+def _log_mel_db(audio: np.ndarray) -> np.ndarray:
+    spec = _stft_magnitude(audio)
+    if spec.shape[0] == 0:
+        return np.zeros((0, N_MELS), dtype=np.float32)
+
     bank = _get_filterbank()
     mel = spec @ bank.T  # (T, N_MELS)
+    return (10.0 * np.log10(np.maximum(mel, LOG_FLOOR))).astype(np.float32, copy=False)
 
-    # log10 × 10, floor.
-    mel = 10.0 * np.log10(np.maximum(mel, LOG_FLOOR))
 
-    # Per-frame z-score with -80 dB clip.
-    mean = mel.mean(axis=1, keepdims=True)
-    std = mel.std(axis=1, keepdims=True).clip(min=1e-9)
-    mel = (mel - mean) / std
-    mel = np.clip(mel, NORM_CLIP, None)
-    return mel.astype(np.float32, copy=False)
+def log_mel(audio: np.ndarray) -> np.ndarray:
+    """Compute the log-mel-spec for a single (already-filtered, 4 kHz mono)
+    audio array. Returns `(n_frames, N_MELS)` float32."""
+    return _normalize_feature_frames(_log_mel_db(audio))
+
+
+def mfcc(audio: np.ndarray) -> np.ndarray:
+    """MFCC channel derived from the same 32-band log-mel frames."""
+    mel = _log_mel_db(audio)
+    if mel.shape[0] == 0:
+        return np.zeros((0, N_MELS), dtype=np.float32)
+    coeffs = spfft.dct(mel, type=2, axis=1, norm="ortho")
+    return _normalize_feature_frames(coeffs)
+
+
+def stft_log_energy(audio: np.ndarray) -> np.ndarray:
+    """Log-STFT energy channel compressed to `(n_frames, N_MELS)`.
+
+    The lower 64 FFT bins are averaged in pairs so this channel has the same
+    spatial shape as log-mel and MFCC while preserving linear-frequency cues.
+    """
+    spec = _stft_magnitude(audio)
+    if spec.shape[0] == 0:
+        return np.zeros((0, N_MELS), dtype=np.float32)
+    log_spec = 10.0 * np.log10(np.maximum(spec[:, : N_MELS * 2], LOG_FLOOR))
+    paired = log_spec.reshape(log_spec.shape[0], N_MELS, 2).mean(axis=2)
+    return _normalize_feature_frames(paired)
+
+
+def _get_scattering(length: int, j: int = SCATTERING_J, q: int = SCATTERING_Q):
+    key = (length, j, q)
+    scattering = _SCATTERING_CACHE.get(key)
+    if scattering is None:
+        try:
+            from kymatio.scattering1d.frontend.numpy_frontend import ScatteringNumPy1D
+        except ImportError as e:
+            raise ImportError(
+                "feature_mode='scattering' requires kymatio; run `uv sync --project model`"
+            ) from e
+        scattering = ScatteringNumPy1D(J=j, shape=length, Q=q)
+        _SCATTERING_CACHE[key] = scattering
+    return scattering
+
+
+def scattering_features(audio: np.ndarray) -> np.ndarray:
+    """Wavelet scattering coefficients as a `(time, coefficients)` feature map."""
+    if audio.ndim != 1:
+        raise ValueError("expected mono 1D input")
+    if len(audio) == 0:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    audio = audio.astype(np.float32, copy=False)
+    audio = audio - float(audio.mean())
+    scale = float(np.max(np.abs(audio)))
+    if scale > 1e-9:
+        audio = audio / scale
+    scattering = _get_scattering(len(audio))
+    coeffs = np.asarray(scattering(audio), dtype=np.float32)
+    if coeffs.ndim != 2:
+        raise ValueError(f"expected 2D scattering output, got shape {coeffs.shape}")
+    coeffs = np.log1p(np.maximum(coeffs, 0.0))
+    return _normalize_feature_frames(coeffs.T)
+
+
+def feature_channels(mode: str) -> int:
+    if mode in (FEATURE_MODE_LOGMEL, FEATURE_MODE_MFCC, FEATURE_MODE_SCATTERING):
+        return 1
+    if mode == FEATURE_MODE_MULTI:
+        return 3
+    raise ValueError(f"unknown feature mode {mode!r}; valid: {FEATURE_MODES}")
+
+
+def window_features(audio: np.ndarray, mode: str = FEATURE_MODE_LOGMEL) -> np.ndarray:
+    """Return model features for one window.
+
+    `logmel` returns `(T, N_MELS)` to preserve the existing production path.
+    `mfcc` returns `(T, N_MELS)` for a single-channel MFCC-only experiment.
+    `scattering` returns `(T, C)` wavelet-scattering coefficients.
+    `multi` returns `(3, T, N_MELS)` with log-mel, MFCC, and log-STFT energy.
+    """
+    if mode == FEATURE_MODE_LOGMEL:
+        return log_mel(audio)
+    if mode == FEATURE_MODE_MFCC:
+        return mfcc(audio)
+    if mode == FEATURE_MODE_SCATTERING:
+        return scattering_features(audio)
+    if mode == FEATURE_MODE_MULTI:
+        return np.stack([log_mel(audio), mfcc(audio), stft_log_energy(audio)], axis=0)
+    raise ValueError(f"unknown feature mode {mode!r}; valid: {FEATURE_MODES}")
 
 
 # ─── 4-second windows ───────────────────────────────────────────────────────

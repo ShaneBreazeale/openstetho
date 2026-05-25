@@ -22,17 +22,20 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
-from .dataset import CirCorMurmurDataset, CirCorRecordingMurmurDataset
-from .model import MurmurCNN, MurmurCNNBiGRU, count_parameters
+from .dataset import CirCorMurmurDataset, CirCorRecordingMurmurDataset, window_hop_samples
+from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D, count_parameters
+from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
 
 log = logging.getLogger("train")
 
 
-def build_model(architecture: str) -> nn.Module:
+def build_model(architecture: str, in_channels: int = 1) -> nn.Module:
     if architecture == "cnn":
-        return MurmurCNN()
+        return MurmurCNN(in_channels=in_channels)
     if architecture == "cnn_bigru":
-        return MurmurCNNBiGRU()
+        return MurmurCNNBiGRU(in_channels=in_channels)
+    if architecture == "scattering_cnn1d":
+        return MurmurScatteringCNN1D()
     raise ValueError(f"unknown architecture {architecture}")
 
 
@@ -190,11 +193,39 @@ def main():
     p.add_argument("--out", type=Path, default=Path("runs/last"))
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--window-seconds", type=float, default=4.0)
+    p.add_argument(
+        "--hop-seconds",
+        type=float,
+        default=None,
+        help="window hop in seconds; defaults to 50 percent overlap",
+    )
     p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     p.add_argument("--level", choices=["window", "recording"], default="window")
-    p.add_argument("--architecture", choices=["cnn", "cnn_bigru"], default="cnn")
+    p.add_argument("--architecture", choices=["cnn", "cnn_bigru", "scattering_cnn1d"], default="cnn")
+    p.add_argument(
+        "--feature-mode",
+        choices=FEATURE_MODES,
+        default=FEATURE_MODE_LOGMEL,
+        help="input representation: logmel production baseline or multi-channel research stack",
+    )
     p.add_argument("--aggregation", choices=["mean", "topk_mean", "max"], default="mean")
     p.add_argument("--topk", type=int, default=3, help="k for --aggregation topk_mean")
+    p.add_argument(
+        "--lr-scheduler",
+        choices=["none", "plateau"],
+        default="none",
+        help="optional validation-AUC ReduceLROnPlateau scheduler",
+    )
+    p.add_argument("--plateau-patience", type=int, default=2)
+    p.add_argument("--plateau-factor", type=float, default=0.5)
+    p.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="stop after N epochs without validation-AUC improvement; 0 disables",
+    )
+    p.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     p.add_argument(
         "--no-cardiac",
         action="store_true",
@@ -208,9 +239,19 @@ def main():
     dev = device(args.device)
     torch.manual_seed(args.seed)
     log.info("device: %s", dev)
+    window_samples, hop_samples = window_hop_samples(args.window_seconds, args.hop_seconds)
+    hop_seconds = hop_samples / SAMPLE_RATE
+    log.info("window: %.3fs (%d samples) hop %.3fs (%d samples)",
+             args.window_seconds, window_samples, hop_seconds, hop_samples)
 
     if args.level == "recording":
-        ds = CirCorRecordingMurmurDataset(args.data, apply_cardiac=not args.no_cardiac)
+        ds = CirCorRecordingMurmurDataset(
+            args.data,
+            apply_cardiac=not args.no_cardiac,
+            feature_mode=args.feature_mode,
+            window_seconds=args.window_seconds,
+            hop_seconds=args.hop_seconds,
+        )
         log.info("dataset: %d recordings | balance: %s", len(ds), ds.class_balance())
         train_ds, val_ds = recording_patient_split(ds, args.val_fraction, args.seed)
         log.info(
@@ -221,7 +262,13 @@ def main():
             args.topk,
         )
     else:
-        ds = CirCorMurmurDataset(args.data, apply_cardiac=not args.no_cardiac)
+        ds = CirCorMurmurDataset(
+            args.data,
+            apply_cardiac=not args.no_cardiac,
+            feature_mode=args.feature_mode,
+            window_seconds=args.window_seconds,
+            hop_seconds=args.hop_seconds,
+        )
         log.info("dataset: %d windows | balance: %s", len(ds), ds.class_balance())
         train_ds, val_ds = patient_split(ds, args.val_fraction, args.seed)
         log.info("split:  train=%d  val=%d", len(train_ds), len(val_ds))
@@ -255,8 +302,9 @@ def main():
             num_workers=args.workers, pin_memory=pin,
         )
 
-    model = build_model(args.architecture).to(dev)
-    log.info("params: %d", count_parameters(model))
+    channels = feature_channels(args.feature_mode)
+    model = build_model(args.architecture, in_channels=channels).to(dev)
+    log.info("features: %s channels=%d | params: %d", args.feature_mode, channels, count_parameters(model))
     # Class-balanced loss: pos_weight = N_neg / N_pos so the minority
     # (murmur-present) class gets a proportional gradient pull.
     bal = ds.class_balance()
@@ -265,9 +313,18 @@ def main():
     pos_weight = torch.tensor([pos_weight_val], device=dev)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="max",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+        )
 
     best_auc = float("-inf")
     saved_best = False
+    epochs_since_improvement = 0
     history = []
     for epoch in range(1, args.epochs + 1):
         if args.level == "recording":
@@ -280,12 +337,23 @@ def main():
         else:
             tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev)
             va_loss, va_auc = run_epoch(model, val_loader, loss_fn, None, dev)
-        history.append({"epoch": epoch, "tr_loss": tr_loss, "tr_auc": tr_auc, "va_loss": va_loss, "va_auc": va_auc})
+        lr_now = float(opt.param_groups[0]["lr"])
+        history.append({
+            "epoch": epoch,
+            "tr_loss": tr_loss,
+            "tr_auc": tr_auc,
+            "va_loss": va_loss,
+            "va_auc": va_auc,
+            "lr": lr_now,
+        })
         log.info("ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f", epoch, tr_loss, tr_auc, va_loss, va_auc)
         torch.save(model.state_dict(), args.out / "last.pt")
-        if np.isfinite(va_auc) and va_auc > best_auc or not saved_best:
+        improved = bool(np.isfinite(va_auc) and va_auc > best_auc + args.early_stopping_min_delta)
+        if improved or not saved_best:
             if np.isfinite(va_auc):
                 best_auc = va_auc
+            if improved:
+                epochs_since_improvement = 0
             saved_best = True
             torch.save(model.state_dict(), args.out / "best.pt")
             (args.out / "best_meta.json").write_text(json.dumps({
@@ -293,9 +361,30 @@ def main():
                 "val_auc": va_auc,
                 "level": args.level,
                 "architecture": args.architecture,
+                "feature_mode": args.feature_mode,
+                "input_channels": channels,
+                "window_seconds": args.window_seconds,
+                "hop_seconds": hop_seconds,
+                "lr_scheduler": args.lr_scheduler,
+                "early_stopping_patience": args.early_stopping_patience,
                 "aggregation": args.aggregation if args.level == "recording" else None,
                 "topk": args.topk if args.level == "recording" else None,
             }))
+        else:
+            epochs_since_improvement += 1
+
+        if scheduler is not None:
+            scheduler.step(va_auc if np.isfinite(va_auc) else -va_loss)
+
+        if (
+            args.early_stopping_patience > 0
+            and epochs_since_improvement >= args.early_stopping_patience
+        ):
+            log.info(
+                "early stopping after %d epochs without validation-AUC improvement",
+                epochs_since_improvement,
+            )
+            break
 
     (args.out / "history.json").write_text(json.dumps(history, indent=2))
     best_auc_msg = f"{best_auc:.3f}" if np.isfinite(best_auc) else "nan"

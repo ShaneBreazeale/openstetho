@@ -29,16 +29,19 @@ import numpy as np
 import torch
 
 from .dataset import CirCorMurmurDataset, _patient_recordings
-from .model import MurmurCNN, MurmurCNNBiGRU
+from .model import MurmurCNN, MurmurCNNBiGRU, MurmurScatteringCNN1D
 from .preprocess import (
+    FEATURE_MODES,
+    FEATURE_MODE_LOGMEL,
     SAMPLE_RATE,
     WINDOW_HOP,
     WINDOW_SAMPLES,
     apply_bandpass,
     apply_cardiac,
+    feature_channels,
     load_audio,
-    log_mel,
     split_windows,
+    window_features,
 )
 from .train import patient_split
 
@@ -52,7 +55,7 @@ class Scorer(Protocol):
     name: str
 
     def score(self, x: np.ndarray) -> tuple[float, float]:
-        """Return `(probability, latency_ms)` for one `(1, 1, 62, 32)` input."""
+        """Return `(probability, latency_ms)` for one model input."""
 
 
 def sigmoid(x: float) -> float:
@@ -224,13 +227,16 @@ def vote_summary(rows: list[dict[str, float]]) -> dict[str, object]:
 class TorchScorer:
     path: Path
     architecture: str = "cnn"
+    in_channels: int = 1
     name: str = "torch"
 
     def __post_init__(self) -> None:
         if self.architecture == "cnn":
-            self.model = MurmurCNN()
+            self.model = MurmurCNN(in_channels=self.in_channels)
         elif self.architecture == "cnn_bigru":
-            self.model = MurmurCNNBiGRU()
+            self.model = MurmurCNNBiGRU(in_channels=self.in_channels)
+        elif self.architecture == "scattering_cnn1d":
+            self.model = MurmurScatteringCNN1D()
         else:
             raise ValueError(f"unknown architecture {self.architecture}")
         state = torch.load(self.path, map_location="cpu", weights_only=True)
@@ -388,13 +394,25 @@ def prepare_audio(
     return audio
 
 
-def model_input_from_window(window: np.ndarray, pad_to_samples: int | None) -> np.ndarray:
+def model_input_from_features(features: torch.Tensor | np.ndarray) -> np.ndarray:
+    arr = features.detach().cpu().numpy() if isinstance(features, torch.Tensor) else features
+    if arr.ndim == 2:
+        return arr[None, None, :, :].astype(np.float32)
+    if arr.ndim == 3:
+        return arr[None, :, :, :].astype(np.float32)
+    raise ValueError(f"expected feature shape (T,F) or (C,T,F), got {arr.shape}")
+
+
+def model_input_from_window(
+    window: np.ndarray,
+    pad_to_samples: int | None,
+    feature_mode: str,
+) -> np.ndarray:
     if pad_to_samples is not None and len(window) < pad_to_samples:
         padded = np.zeros(pad_to_samples, dtype=np.float32)
         padded[: len(window)] = window
         window = padded
-    mel = log_mel(window)
-    return mel[None, None, :, :].astype(np.float32)
+    return model_input_from_features(window_features(window, feature_mode))
 
 
 def iter_examples(dataset, max_windows: int | None, include_raw: bool, apply_filter: bool):
@@ -402,7 +420,7 @@ def iter_examples(dataset, max_windows: int | None, include_raw: bool, apply_fil
     for i in range(n):
         patient_id, loc, wav, _entry_label, w_idx = dataset_entry(dataset, i)
         mel, label = dataset[i]
-        x = mel.unsqueeze(0).unsqueeze(0).numpy().astype(np.float32)
+        x = model_input_from_features(mel)
         raw = raw_window(dataset, i, apply_filter) if include_raw else None
         meta = {
             "idx": i,
@@ -426,6 +444,7 @@ def iter_custom_examples(
     hop_samples: int,
     pad_to_samples: int | None,
     max_recording_seconds: float | None,
+    feature_mode: str,
 ):
     yielded = 0
     for _, row in ds.metadata.iterrows():
@@ -445,7 +464,7 @@ def iter_custom_examples(
             for w_idx, window in enumerate(windows):
                 if max_windows is not None and yielded >= max_windows:
                     return
-                x = model_input_from_window(window, pad_to_samples)
+                x = model_input_from_window(window, pad_to_samples, feature_mode)
                 raw = window.astype(np.float32, copy=False) if include_raw else None
                 meta = {
                     "idx": yielded,
@@ -467,7 +486,14 @@ def parse_int_list(raw: str) -> list[int]:
 
 
 def run(args: argparse.Namespace) -> dict:
-    ds = CirCorMurmurDataset(args.data, apply_cardiac=args.apply_cardiac)
+    if args.feature_mode != FEATURE_MODE_LOGMEL and (args.coreml or args.onnx):
+        raise SystemExit("--feature-mode mfcc/multi is only supported for --checkpoint benchmarking")
+
+    ds = CirCorMurmurDataset(
+        args.data,
+        apply_cardiac=args.apply_cardiac,
+        feature_mode=args.feature_mode,
+    )
     bench_ds = choose_split(ds, args.split, args.val_fraction, args.seed)
     bench_ds = filter_by_label(bench_ds, args.label_filter)
     custom_windowing = (
@@ -490,7 +516,13 @@ def run(args: argparse.Namespace) -> dict:
 
     scorers: list[Scorer] = []
     if args.checkpoint:
-        scorers.append(TorchScorer(args.checkpoint, architecture=args.architecture))
+        scorers.append(
+            TorchScorer(
+                args.checkpoint,
+                architecture=args.architecture,
+                in_channels=feature_channels(args.feature_mode),
+            )
+        )
     if args.coreml:
         scorers.append(CoreMLScorer(args.coreml))
     if args.onnx:
@@ -527,6 +559,7 @@ def run(args: argparse.Namespace) -> dict:
             hop_samples=hop_samples,
             pad_to_samples=pad_to_samples,
             max_recording_seconds=args.max_recording_seconds,
+            feature_mode=args.feature_mode,
         )
         if custom_windowing
         else iter_examples(
@@ -569,6 +602,8 @@ def run(args: argparse.Namespace) -> dict:
         "val_fraction": args.val_fraction,
         "seed": args.seed,
         "apply_cardiac": args.apply_cardiac,
+        "feature_mode": args.feature_mode,
+        "input_channels": feature_channels(args.feature_mode),
         "bandpass": list(args.bandpass) if args.bandpass is not None else None,
         "bench_window_seconds": args.bench_window_seconds,
         "bench_hop_seconds": args.bench_hop_seconds,
@@ -687,7 +722,13 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, required=True, help="CirCor root")
     p.add_argument("--checkpoint", type=Path, default=None, help="PyTorch MurmurCNN checkpoint")
-    p.add_argument("--architecture", choices=["cnn", "cnn_bigru"], default="cnn")
+    p.add_argument("--architecture", choices=["cnn", "cnn_bigru", "scattering_cnn1d"], default="cnn")
+    p.add_argument(
+        "--feature-mode",
+        choices=FEATURE_MODES,
+        default=FEATURE_MODE_LOGMEL,
+        help="PyTorch checkpoint feature representation; Core ML/ONNX benchmark inputs remain logmel",
+    )
     p.add_argument("--coreml", type=Path, default=None, help="Core ML MurmurCNN.mlpackage")
     p.add_argument("--onnx", type=Path, default=None, help="ONNX baseline model")
     p.add_argument("--onnx-output-kind", choices=["logit", "prob"], default="logit")

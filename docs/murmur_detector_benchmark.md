@@ -185,14 +185,272 @@ current Core ML benchmark. It should still be treated as an experimental
 checkpoint until it is evaluated with patient-level cross-validation and an
 export/deployment plan.
 
+## Multi-Channel Feature Experiment
+
+The FLAIRS PCG representation paper motivated a PyTorch-only research path
+that stacks three feature maps as model input:
+
+- log-mel, matching the current baseline channel
+- MFCC, derived from the same 32-band mel frames
+- log-STFT energy, pair-averaged from the lower 64 linear-frequency bins
+
+Training used the same patient-level split, recording-level mean
+aggregation, CNN+BiGRU architecture, and 5-epoch budget as the released
+log-mel-only checkpoint:
+
+```bash
+uv run --project model python -m openstetho_model.train \
+    --data $CIRCOR_ROOT \
+    --level recording \
+    --architecture cnn_bigru \
+    --feature-mode multi \
+    --aggregation mean \
+    --no-cardiac \
+    --epochs 5 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --out model/runs/murmur_cnn_bigru_multi_full_v1
+```
+
+`best_meta.json`:
+
+```json
+{"epoch": 3, "val_auc": 0.7886464930799906, "level": "recording", "architecture": "cnn_bigru", "feature_mode": "multi", "input_channels": 3, "aggregation": "mean", "topk": 3}
+```
+
+Benchmark command:
+
+```bash
+uv run --project model python -m openstetho_model.bench_murmur \
+    --data $CIRCOR_ROOT \
+    --checkpoint model/runs/murmur_cnn_bigru_multi_full_v1/best.pt \
+    --architecture cnn_bigru \
+    --feature-mode multi \
+    --split all \
+    --label-filter all \
+    --threshold 0.5 \
+    --recording-aggregates mean top3_mean max \
+    --out model/runs/murmur_bench/full_all_cnn_bigru_multi_full_v1_predictions.csv \
+    --sweep-out model/runs/murmur_bench/full_all_cnn_bigru_multi_full_v1_sweep.csv \
+    --json model/runs/murmur_bench/full_all_cnn_bigru_multi_full_v1_report.json
+```
+
+Result against the released log-mel CNN+BiGRU:
+
+| model | feature mode | aggregation | AUROC | best-F1 threshold | sensitivity | specificity | F1 |
+|---|---|---|---:|---:|---:|---:|---:|
+| CNN+BiGRU | logmel | mean | 0.868 | 0.682 | 0.634 | 0.956 | 0.702 |
+| CNN+BiGRU | multi | mean | 0.777 | 0.336 | 0.583 | 0.858 | 0.545 |
+| CNN+BiGRU | multi | top3_mean | 0.766 | 0.415 | 0.546 | 0.873 | 0.535 |
+| CNN+BiGRU | multi | max | 0.763 | 0.492 | 0.515 | 0.896 | 0.536 |
+
+Interpretation: simply stacking MFCC and linear-STFT energy did not improve
+this architecture. The added channels likely need either different
+normalization, channel dropout/regularization, a wider frontend, or
+cross-validation before revisiting. Keep the released log-mel CNN+BiGRU as
+the stronger benchmark.
+
+## 5-Second MFCC Experiment
+
+The Tsai et al. CapsNet paper is not directly comparable to this CirCor
+murmur-present benchmark: it uses MFCC spectrum images, 5-second segments,
+and a normal/abnormal framing. The useful transfer is the representation
+and window-length choice, not the full CapsNet architecture. The PyTorch
+research path now supports both:
+
+- `--window-seconds 5` with 50 percent overlap by default
+- `--feature-mode mfcc` for a single-channel MFCC-only model
+- `--lr-scheduler plateau` for validation-AUC `ReduceLROnPlateau`
+- `--early-stopping-patience N`
+
+Training commands:
+
+```bash
+uv run --project model python -m openstetho_model.train \
+    --data $CIRCOR_ROOT \
+    --level recording \
+    --architecture cnn_bigru \
+    --feature-mode logmel \
+    --window-seconds 5 \
+    --aggregation mean \
+    --no-cardiac \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cnn_bigru_logmel_5s_v1
+
+uv run --project model python -m openstetho_model.train \
+    --data $CIRCOR_ROOT \
+    --level recording \
+    --architecture cnn_bigru \
+    --feature-mode mfcc \
+    --window-seconds 5 \
+    --aggregation mean \
+    --no-cardiac \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cnn_bigru_mfcc_5s_v1
+```
+
+Best checkpoints:
+
+```json
+{"epoch": 7, "val_auc": 0.832512315270936, "level": "recording", "architecture": "cnn_bigru", "feature_mode": "logmel", "input_channels": 1, "window_seconds": 5.0, "hop_seconds": 2.5, "lr_scheduler": "plateau", "early_stopping_patience": 2, "aggregation": "mean", "topk": 3}
+{"epoch": 6, "val_auc": 0.8624040749304648, "level": "recording", "architecture": "cnn_bigru", "feature_mode": "mfcc", "input_channels": 1, "window_seconds": 5.0, "hop_seconds": 2.5, "lr_scheduler": "plateau", "early_stopping_patience": 2, "aggregation": "mean", "topk": 3}
+```
+
+Benchmark command shape:
+
+```bash
+uv run --project model python -m openstetho_model.bench_murmur \
+    --data $CIRCOR_ROOT \
+    --checkpoint model/runs/murmur_cnn_bigru_mfcc_5s_v1/best.pt \
+    --architecture cnn_bigru \
+    --feature-mode mfcc \
+    --split all \
+    --label-filter all \
+    --threshold 0.5 \
+    --bench-window-seconds 5 \
+    --bench-hop-seconds 2.5 \
+    --recording-aggregates mean top3_mean max \
+    --out model/runs/murmur_bench/full_all_cnn_bigru_mfcc_5s_v1_predictions.csv \
+    --sweep-out model/runs/murmur_bench/full_all_cnn_bigru_mfcc_5s_v1_sweep.csv \
+    --json model/runs/murmur_bench/full_all_cnn_bigru_mfcc_5s_v1_report.json
+```
+
+Results:
+
+| model | feature | window | aggregation | AUROC | best-F1 threshold | sensitivity | specificity | F1 |
+|---|---|---:|---|---:|---:|---:|---:|---:|
+| CNN+BiGRU released | logmel | 4s | mean | 0.868 | 0.682 | 0.634 | 0.956 | 0.702 |
+| CNN+BiGRU | logmel | 5s | mean | 0.902 | 0.535 | 0.761 | 0.898 | 0.705 |
+| CNN+BiGRU | logmel | 5s | top3_mean | 0.895 | 0.925 | 0.658 | 0.947 | 0.706 |
+| CNN+BiGRU | mfcc | 5s | mean | 0.882 | 0.758 | 0.663 | 0.969 | 0.744 |
+| CNN+BiGRU | mfcc | 5s | top3_mean | 0.879 | 0.955 | 0.677 | 0.958 | 0.735 |
+| CNN+BiGRU | mfcc | 5s | max | 0.875 | 0.987 | 0.650 | 0.955 | 0.713 |
+
+Interpretation from this single split: the 5-second window is useful. The
+5s log-mel model has the best ranking metric in this set (`AUROC=0.902`),
+while the 5s MFCC model gives the strongest calibrated best-F1 operating
+point (`F1=0.744`, specificity `0.969`). This needed cross-validation
+before promoting either checkpoint.
+
+## 5-Fold Patient-Level CV
+
+The patient-level CV runner trains a separate model per fold, keeps every
+patient wholly in train or validation, and writes both per-fold checkpoints
+and pooled out-of-fold recording predictions.
+
+Command shape:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --feature-mode mfcc \
+    --window-seconds 5 \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --no-cardiac \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cv_mfcc_5s_v1
+```
+
+Wavelet scattering / 1D-CNN command shape, motivated by the KAUST
+WST+1D-CNN paper:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture scattering_cnn1d \
+    --feature-mode scattering \
+    --window-seconds 5 \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --no-cardiac \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cv_scattering_5s_v1
+```
+
+CV artifacts:
+
+- `model/runs/murmur_cv_logmel_5s_v1/cv_report.json`
+- `model/runs/murmur_cv_logmel_5s_v1/oof_predictions.csv`
+- `model/runs/murmur_cv_mfcc_5s_v1/cv_report.json`
+- `model/runs/murmur_cv_mfcc_5s_v1/oof_predictions.csv`
+- `model/runs/murmur_cv_scattering_5s_v1/cv_report.json`
+- `model/runs/murmur_cv_scattering_5s_v1/oof_predictions.csv`
+
+Results:
+
+| feature | mean fold AUROC | fold AUROC std | pooled OoF AUROC | OoF best-F1 threshold | sensitivity | specificity | F1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| logmel 5s | 0.825 | 0.027 | 0.809 | 0.471 | 0.630 | 0.872 | 0.592 |
+| mfcc 5s | 0.854 | 0.022 | 0.800 | 0.557 | 0.573 | 0.898 | 0.582 |
+| scattering 5s + 1D-CNN | 0.522 | 0.069 | 0.517 | 0.298 | 0.998 | 0.002 | 0.340 |
+
+Fold AUROCs:
+
+| feature | fold 1 | fold 2 | fold 3 | fold 4 | fold 5 |
+|---|---:|---:|---:|---:|---:|
+| logmel 5s | 0.825 | 0.874 | 0.805 | 0.824 | 0.796 |
+| mfcc 5s | 0.881 | 0.866 | 0.849 | 0.862 | 0.815 |
+| scattering 5s + 1D-CNN | 0.565 | 0.469 | 0.462 | 0.637 | 0.476 |
+
+Interpretation from CV: MFCC is more consistent fold-by-fold and has the
+better mean validation AUROC, but pooled out-of-fold AUROC/F1 does not beat
+5s log-mel. That means the single-split MFCC operating point was optimistic
+and fold-specific score calibration is a problem. The next useful step is
+not another single split; it is per-fold threshold calibration, probability
+calibration, or a training objective that gives better cross-fold score
+alignment.
+
+The simple wavelet-scattering implementation is a negative result in this
+pipeline. It uses Kymatio WST coefficients (`J=8`, `Q=4`) from 5-second
+windows and a small 1D-CNN, but pooled OoF AUROC is near chance. Do not
+pursue this branch unless reproducing the paper's fuller preprocessing
+stack, including denoising, segmentation, noise-only segment relabeling, and
+normalization details, or unless retuning the scattering/frontend
+architecture from scratch.
+
 ## Current Recommendation
 
 - Do not replace the app model with the earlier `murmur_recording_top3_v1`
   checkpoint; its full benchmark AUROC was below 0.5.
-- Keep current Core ML for the app until the CNN+BiGRU result is validated
-  across patient-level folds.
+- Keep the released log-mel CNN+BiGRU as the app-facing murmur checkpoint.
+  The 5s MFCC single-split result did not hold up as a pooled OoF
+  improvement under patient-level CV.
+- Treat 5s MFCC-only as a useful representation candidate because its fold
+  AUROC is consistently strong, but do not promote it without calibration.
+- Do not pursue the stacked multi-channel path unless changing the
+  architecture or regularization.
+- Do not pursue the current wavelet-scattering + 1D-CNN path as-is; its
+  5-fold patient-level pooled OoF AUROC was near chance.
 - Use recording-level mean aggregation as the primary decision rule.
 - Keep vote-count sweeps in the benchmark for sensitivity/specificity
   exploration, especially once a model is trained natively on 2.5 s windows.
-- Run the next CNN+BiGRU experiment with 5-fold patient-level CV, early
-  stopping, and threshold calibration per fold.
+- Next CNN+BiGRU work should focus on per-fold threshold calibration,
+  probability calibration, and reporting calibrated CV metrics.

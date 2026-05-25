@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.nn.parameter import UninitializedParameter
 
 from .preprocess import N_MELS
 
@@ -31,9 +32,9 @@ def conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
 class MurmurCNN(nn.Module):
     """Tiny VGG-style CNN. ~74k trainable params."""
 
-    def __init__(self, n_classes: int = 1):
+    def __init__(self, n_classes: int = 1, in_channels: int = 1):
         super().__init__()
-        self.b1 = conv_block(1, 16)   # (B, 16, T/2,  N/2)
+        self.b1 = conv_block(in_channels, 16)   # (B, 16, T/2,  N/2)
         self.b2 = conv_block(16, 32)  # (B, 32, T/4,  N/4)
         self.b3 = conv_block(32, 64)  # (B, 64, T/8,  N/8)
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -66,9 +67,9 @@ class MurmurCNNBiGRU(nn.Module):
     `MurmurCNN`.
     """
 
-    def __init__(self, n_classes: int = 1, hidden_size: int = 48):
+    def __init__(self, n_classes: int = 1, hidden_size: int = 48, in_channels: int = 1):
         super().__init__()
-        self.b1 = conv_block_pool(1, 24, pool=(2, 2))
+        self.b1 = conv_block_pool(in_channels, 24, pool=(2, 2))
         self.b2 = conv_block_pool(24, 48, pool=(1, 2))
         self.b3 = conv_block_pool(48, 96, pool=(1, 2))
         self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))
@@ -98,6 +99,50 @@ class MurmurCNNBiGRU(nn.Module):
         seq, _ = self.gru(x)
         pooled = seq.mean(dim=1)
         return self.head(pooled).squeeze(-1)
+
+
+class MurmurScatteringCNN1D(nn.Module):
+    """Small 1D CNN for wavelet-scattering feature maps.
+
+    Input shape is `(B, T, C)` where `C` is the scattering coefficient axis.
+    The network treats scattering coefficients as 1D channels and convolves
+    along time, matching the low-risk part of scattering+1D-CNN papers while
+    staying usable with the existing recording-level aggregation loop.
+    """
+
+    def __init__(self, n_classes: int = 1):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.LazyConv1d(64, kernel_size=5, padding=2, bias=False),
+            nn.LazyBatchNorm1d(),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(96),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(2),
+            nn.Conv1d(96, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(128, 48),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(48, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        if x.ndim != 3:
+            raise ValueError(f"expected (B,T,C) scattering input, got {tuple(x.shape)}")
+        x = x.transpose(1, 2)
+        x = self.features(x)
+        return self.head(x).squeeze(-1)
 
 
 class S3CNN(nn.Module):
@@ -269,7 +314,11 @@ class S3CNN_v3(nn.Module):
 
 
 def count_parameters(m: nn.Module) -> int:
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
+    return sum(
+        p.numel()
+        for p in m.parameters()
+        if p.requires_grad and not isinstance(p, UninitializedParameter)
+    )
 
 
 if __name__ == "__main__":
