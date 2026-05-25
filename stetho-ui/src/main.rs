@@ -26,6 +26,10 @@ use tracing::{error, info};
 const WAVEFORM_SECONDS: usize = 5;
 const WAVEFORM_LEN: usize = AUDIO_SAMPLE_RATE_HZ as usize * WAVEFORM_SECONDS;
 const SPECTROGRAM_FRAMES: usize = 128;
+/// Tuned on the local CirCor benchmark using recording-level mean
+/// aggregation. At this threshold, mean aggregation gave the best F1
+/// among the checked post-processing choices.
+const MURMUR_RECORDING_MEAN_THRESHOLD: f32 = 0.49331352;
 const DEFAULT_MODEL_DOWNLOAD_URL: &str =
     "https://github.com/ShaneBreazeale/openstetho/releases/latest/download/MurmurCNN.mlpackage.zip";
 
@@ -82,6 +86,9 @@ struct App {
     gain_db: f32,
     show_spec: bool,
     murmur_prob: Option<f32>,
+    murmur_mean_prob: Option<f32>,
+    murmur_prob_sum: f32,
+    murmur_prob_count: usize,
     murmur_history: Vec<f32>,
     s3_prob: Option<f32>,
     s3_history: Vec<f32>,
@@ -112,6 +119,9 @@ impl App {
             gain_db: 0.0,
             show_spec: true,
             murmur_prob: None,
+            murmur_mean_prob: None,
+            murmur_prob_sum: 0.0,
+            murmur_prob_count: 0,
             murmur_history: Vec::with_capacity(60),
             s3_prob: None,
             s3_history: Vec::with_capacity(60),
@@ -121,10 +131,23 @@ impl App {
         }
     }
 
+    fn reset_murmur_aggregation(&mut self) {
+        self.murmur_prob = None;
+        self.murmur_mean_prob = None;
+        self.murmur_prob_sum = 0.0;
+        self.murmur_prob_count = 0;
+        self.murmur_history.clear();
+    }
+
     fn drain(&mut self) {
         loop {
             match self.rx.try_recv() {
-                Ok(Msg::State(s)) => self.state = s,
+                Ok(Msg::State(s)) => {
+                    if s == ConnState::Streaming && self.state != ConnState::Streaming {
+                        self.reset_murmur_aggregation();
+                    }
+                    self.state = s;
+                }
                 Ok(Msg::Status(s)) => self.status = s,
                 Ok(Msg::Battery(b)) => self.battery = Some(b),
                 Ok(Msg::Samples(buf)) => {
@@ -150,6 +173,10 @@ impl App {
                 }
                 Ok(Msg::MurmurProb(p)) => {
                     self.murmur_prob = Some(p);
+                    self.murmur_prob_sum += p;
+                    self.murmur_prob_count += 1;
+                    self.murmur_mean_prob =
+                        Some(self.murmur_prob_sum / self.murmur_prob_count as f32);
                     if self.murmur_history.len() == 60 {
                         self.murmur_history.remove(0);
                     }
@@ -173,8 +200,7 @@ impl App {
                                 self.available_models.dedup();
                             }
                             self.model_path = Some(path.clone());
-                            self.murmur_prob = None;
-                            self.murmur_history.clear();
+                            self.reset_murmur_aggregation();
                             self.s3_prob = None;
                             self.s3_history.clear();
                             let _ = self.cmd_tx.send(Cmd::SetModel(path));
@@ -228,14 +254,22 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label(format!("rx: {} samples", self.total_samples));
-                if let Some(p) = self.murmur_prob {
+                if let Some(p) = self.murmur_mean_prob {
                     ui.separator();
-                    let color = if p > 0.5 {
+                    let color = if p >= MURMUR_RECORDING_MEAN_THRESHOLD {
                         egui::Color32::from_rgb(220, 60, 60)
                     } else {
                         egui::Color32::from_rgb(80, 180, 80)
                     };
-                    ui.colored_label(color, format!("murmur: {:.0}%", p * 100.0));
+                    let latest = self.murmur_prob.unwrap_or(p);
+                    ui.colored_label(
+                        color,
+                        format!(
+                            "murmur mean: {:.0}% latest {:.0}%",
+                            p * 100.0,
+                            latest * 100.0
+                        ),
+                    );
                 }
                 if let Some(p) = self.s3_prob {
                     ui.separator();
@@ -276,8 +310,7 @@ impl eframe::App for App {
                     if let Some(p) = chosen {
                         if Some(&p) != self.model_path.as_ref() {
                             self.model_path = Some(p.clone());
-                            self.murmur_prob = None;
-                            self.murmur_history.clear();
+                            self.reset_murmur_aggregation();
                             self.s3_prob = None;
                             self.s3_history.clear();
                             let _ = self.cmd_tx.send(Cmd::SetModel(p));
@@ -660,7 +693,10 @@ async fn stream_session(
             }
             return match S3Engine::load(&candidate, N_FRAMES_S3) {
                 Ok(e) => {
-                    let _ = tx.send(Msg::Status(format!("S3 model loaded: {}", candidate.display())));
+                    let _ = tx.send(Msg::Status(format!(
+                        "S3 model loaded: {}",
+                        candidate.display()
+                    )));
                     Some((e, candidate))
                 }
                 Err(err) => {

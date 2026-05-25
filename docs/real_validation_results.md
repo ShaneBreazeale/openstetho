@@ -27,7 +27,7 @@ Combined real-set summary (n=41, 5 S3-positive):
 
 | threshold | sensitivity | specificity | F1 | regime |
 |---|---|---|---|---|
-| 0.50 | 1.000 (5/5) | 0.472 (17/36) | 0.27 | all positives caught, ~half negatives admitted |
+| 0.50 | 1.000 (5/5) | 0.472 (17/36) | 0.34 | all positives caught, ~half negatives admitted |
 | **0.934** | **1.000 (5/5)** | **0.917 (33/36)** | **0.77** | **Youden's J maximum — best balance** |
 | 0.99 | 0.800 (4/5) | 1.000 (36/36) | 0.89 | zero false positives but misses 1 S3 |
 
@@ -46,9 +46,11 @@ positives) or high-specificity (threshold ~0.99, miss ~20% of S3s). The
 real cardiologist annotation pipeline is the only path to choosing this
 trade-off responsibly.
 
-**The model achieves perfect ranking on real labeled data.** Every true S3
-clip scores above every confounder clip. Threshold needs to move from the
-synth-set default of 0.5 to ~0.99 on real audio to recover specificity.
+**The model no longer has perfect ranking on the tiny real labeled set.**
+The lowest true-positive score (0.963) is below the highest false-positive
+score (0.979), so AUROC is no longer 1.0. Threshold needs to move from the
+synth-set default of 0.5 to a deliberate operating point: around 0.93 for
+high sensitivity, or around 0.99 for high specificity.
 
 ## All scores
 
@@ -107,37 +109,40 @@ The full curve is written to `data/s3_validation/threshold_sweep.csv`.
 
 | threshold | sens | spec | F1 |
 |---|---|---|---|
-| 0.50 (default) | 1.000 | 0.472 | 0.240 |
-| 0.80 | 1.000 | 0.806 | 0.462 |
-| 0.95 | 1.000 | 0.917 | 0.667 |
-| **0.999 (Youden J max)** | **1.000** | **1.000** | **1.000** |
+| 0.50 (default) | 1.000 | 0.472 | 0.345 |
+| 0.80 | 1.000 | 0.833 | 0.625 |
+| **0.934 (Youden J max)** | **1.000** | **0.917** | **0.769** |
+| 0.99 | 0.800 | 1.000 | 0.889 |
 
-Anywhere in the open interval (0.979, 0.999] gives perfect classification
-on this combined set. Choose 0.99 for a ~0.02 safety margin until more
-real labels arrive.
+The current set is too small to declare a stable threshold. The practical
+choice is between a high-sensitivity point around 0.93, which catches all
+5 positives while admitting 3 false positives, and a high-specificity point
+around 0.99, which eliminates false positives but misses the 0.963 S3 clip.
 
 ## Interpretation
 
-1. **Ranking is perfect.** The model's separation between real S3 and
-   real-world confounders is clean. AUROC 1.0 / AUPRC 1.0 on combined
-   real data exceeds the 0.89 synthetic-set ceiling we kept hitting.
+1. **Ranking is no longer perfect.** The model still separates most real
+   S3 clips from most confounders, but one true S3 scores below one
+   high-scoring click/ejection-murmur confounder. Treat the validation set
+   as a threshold-finding smoke test, not a final ranking claim.
 2. **Default threshold is wrong for real audio.** The synth-set's
    well-calibrated ECE 0.022 does not carry over — real recordings have
-   stronger S1/S2 thumps so any confounder cycle scores higher than its
-   synth analog. Recalibrate at 0.99 minimum.
+   stronger S1/S2 thumps so confounder cycles can score higher than their
+   synth analogs. Recalibrate around 0.93 for high sensitivity or around
+   0.99 for high specificity.
 3. **The synth-label ceiling was a measurement artifact**, not a real
    capability ceiling. The synthetic test set was harder than the real
    clinical task because we deliberately injected S3 at SNR -3 to 12 dB
-   to push the model. Real S3 in teaching clips is much more audible
-   and the model resolves it cleanly.
+   to push the model. Real S3 in teaching clips is often more audible,
+   though the current set is too small and heterogeneous for a firm claim.
 4. **Confounder hierarchy (real audio, threshold 0.5):**
    `S3 > split-S2 > ejection-click > S4 > murmur > normal`. Split-S2 is
    the strongest false-positive driver — its timing overlap with S3 is
    the predictable failure mode our synthetic S4 mining did not cover.
-5. **Sample size is tiny.** Three real positives is not statistically
-   meaningful for clinical claims; both AUROCs collapse on a slightly
-   harder corpus. Need ~50 real positives minimum to bound the operating
-   point. The cardiologist annotation pipeline at
+5. **Sample size is tiny.** Five real positives is not statistically
+   meaningful for clinical claims, and the ranking already changed when a
+   slightly harder positive clip was added. Need ~50 real positives minimum
+   to bound the operating point. The cardiologist annotation pipeline at
    `docs/s3_annotation_pipeline.md` is still the next step.
 
 ## How to reproduce

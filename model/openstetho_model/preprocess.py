@@ -65,6 +65,28 @@ def apply_s3_preset(x: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray
     return sps.sosfilt(s3_sos(sample_rate), x).astype(np.float32, copy=False)
 
 
+def bandpass_sos(
+    low_hz: float,
+    high_hz: float,
+    sample_rate: int = SAMPLE_RATE,
+    order: int = 4,
+) -> np.ndarray:
+    """Butterworth bandpass for offline benchmark experiments."""
+    return sps.butter(order, [low_hz, high_hz], btype="bandpass", fs=sample_rate, output="sos")
+
+
+def apply_bandpass(
+    x: np.ndarray,
+    low_hz: float,
+    high_hz: float,
+    sample_rate: int = SAMPLE_RATE,
+    order: int = 4,
+) -> np.ndarray:
+    """Apply a zero-phase offline bandpass. Not used by the realtime path."""
+    sos = bandpass_sos(low_hz, high_hz, sample_rate=sample_rate, order=order)
+    return sps.sosfiltfilt(sos, x).astype(np.float32, copy=False)
+
+
 # ─── resample + load ────────────────────────────────────────────────────────
 
 def load_audio(path: str, target_sr: int = SAMPLE_RATE) -> np.ndarray:

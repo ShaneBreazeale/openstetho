@@ -57,6 +57,49 @@ class MurmurCNN(nn.Module):
         return x.squeeze(-1)
 
 
+class MurmurCNNBiGRU(nn.Module):
+    """CNN frontend with a bidirectional GRU temporal head.
+
+    This keeps frequency pooling aggressive while preserving a reduced time
+    axis for the recurrent layer. It is intended for offline experiments
+    before any export/ANE work; the current production Core ML model remains
+    `MurmurCNN`.
+    """
+
+    def __init__(self, n_classes: int = 1, hidden_size: int = 48):
+        super().__init__()
+        self.b1 = conv_block_pool(1, 24, pool=(2, 2))
+        self.b2 = conv_block_pool(24, 48, pool=(1, 2))
+        self.b3 = conv_block_pool(48, 96, pool=(1, 2))
+        self.freq_pool = nn.AdaptiveAvgPool2d((None, 1))
+        self.gru = nn.GRU(
+            input_size=96,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.head = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(hidden_size * 2, 48),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(48, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        x = self.b1(x)
+        x = self.b2(x)
+        x = self.b3(x)
+        x = self.freq_pool(x).squeeze(-1)  # (B, C, T')
+        x = x.transpose(1, 2)              # (B, T', C)
+        seq, _ = self.gru(x)
+        pooled = seq.mean(dim=1)
+        return self.head(pooled).squeeze(-1)
+
+
 class S3CNN(nn.Module):
     """Bigger-capacity backbone for S3 detection.
 

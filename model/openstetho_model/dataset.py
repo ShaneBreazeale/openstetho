@@ -30,7 +30,6 @@ import torch
 from torch.utils.data import Dataset
 
 from .preprocess import (
-    N_MELS,
     WINDOW_SAMPLES,
     apply_cardiac,
     load_audio,
@@ -160,4 +159,76 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
         return {"absent": absent, "present": present}
 
 
-__all__ = ["CirCorMurmurDataset", "CirCorSample"]
+class CirCorRecordingMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
+    """Recording-level murmur dataset.
+
+    Each item is all 4-second windows from one recording:
+        mels: torch.Tensor (n_windows, n_frames, N_MELS)
+        label: int
+
+    This supports multiple-instance learning where the model scores every
+    window and training aggregates those logits to the recording label.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        patient_ids: Sequence[int] | None = None,
+        apply_cardiac: bool = True,
+        profile_fir_path: str | Path | None = None,
+    ):
+        self.root = Path(root)
+        self.apply_cardiac_filter = apply_cardiac
+        self._profile_fir: np.ndarray | None = None
+        if profile_fir_path is not None:
+            import json
+            data = json.loads(Path(profile_fir_path).read_text())
+            self._profile_fir = np.asarray(data["coefficients"], dtype=np.float32)
+            log.info(
+                "CirCor recording audio will be convolved with profile FIR (%d taps) from %s",
+                len(self._profile_fir),
+                profile_fir_path,
+            )
+
+        df = _load_metadata(self.root / "training_data.csv")
+        df = df[df["Murmur"].isin(["Present", "Absent"])].copy()
+        if patient_ids is not None:
+            df = df[df["Patient ID"].isin(patient_ids)]
+        self.metadata = df.reset_index(drop=True)
+        self._records: list[tuple[int, str, Path, int]] = []
+        for _, row in self.metadata.iterrows():
+            label = 1 if row["Murmur"] == "Present" else 0
+            for loc, wav in _patient_recordings(
+                self.root,
+                int(row["Patient ID"]),
+                row["Recording locations:"],
+            ):
+                self._records.append((int(row["Patient ID"]), loc, wav, label))
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        _patient_id, _loc, wav, label = self._records[idx]
+        audio = load_audio(str(wav))
+        if self._profile_fir is not None:
+            import scipy.signal as sps
+            audio = sps.lfilter(self._profile_fir, [1.0], audio).astype(np.float32)
+        if self.apply_cardiac_filter:
+            audio = apply_cardiac(audio)
+        windows = split_windows(audio)
+        if len(windows) == 0:
+            # Keep the model path defined for very short clips.
+            padded = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
+            padded[: min(len(audio), WINDOW_SAMPLES)] = audio[:WINDOW_SAMPLES]
+            windows = np.expand_dims(padded, axis=0)
+        mels = np.stack([log_mel(w) for w in windows], axis=0)
+        return torch.from_numpy(mels), label
+
+    def class_balance(self) -> dict[str, int]:
+        absent = sum(1 for *_, label in self._records if label == 0)
+        present = len(self._records) - absent
+        return {"absent": absent, "present": present}
+
+
+__all__ = ["CirCorMurmurDataset", "CirCorRecordingMurmurDataset", "CirCorSample"]

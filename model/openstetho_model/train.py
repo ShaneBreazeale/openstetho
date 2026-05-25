@@ -22,13 +22,23 @@ import torch.nn as nn
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
-from .dataset import CirCorMurmurDataset
-from .model import MurmurCNN, count_parameters
+from .dataset import CirCorMurmurDataset, CirCorRecordingMurmurDataset
+from .model import MurmurCNN, MurmurCNNBiGRU, count_parameters
 
 log = logging.getLogger("train")
 
 
-def device() -> torch.device:
+def build_model(architecture: str) -> nn.Module:
+    if architecture == "cnn":
+        return MurmurCNN()
+    if architecture == "cnn_bigru":
+        return MurmurCNNBiGRU()
+    raise ValueError(f"unknown architecture {architecture}")
+
+
+def device(preferred: str = "auto") -> torch.device:
+    if preferred != "auto":
+        return torch.device(preferred)
     if torch.backends.mps.is_available():
         return torch.device("mps")
     if torch.cuda.is_available():
@@ -39,15 +49,69 @@ def device() -> torch.device:
 def patient_split(ds: CirCorMurmurDataset, val_fraction: float = 0.15, seed: int = 0):
     """Group-aware split: every window of a given patient lands in one side
     of the split. Prevents leakage at the patient level."""
-    patient_ids = sorted({pid for pid, *_ in ds._index})
-    rng = np.random.default_rng(seed)
-    rng.shuffle(patient_ids)
-    cut = int(len(patient_ids) * (1.0 - val_fraction))
-    train_ids = set(patient_ids[:cut])
-    val_ids = set(patient_ids[cut:])
+    patient_labels = _patient_labels([(pid, label) for pid, *_rest, label, _w in ds._index])
+    train_ids, val_ids = _stratified_patient_ids(patient_labels, val_fraction, seed)
     train_idx = [i for i, (pid, *_) in enumerate(ds._index) if pid in train_ids]
     val_idx = [i for i, (pid, *_) in enumerate(ds._index) if pid in val_ids]
     return Subset(ds, train_idx), Subset(ds, val_idx)
+
+
+def _patient_labels(rows: list[tuple[int, int]]) -> dict[int, int]:
+    labels: dict[int, int] = {}
+    for pid, label in rows:
+        prior = labels.setdefault(pid, label)
+        if prior != label:
+            raise ValueError(f"patient {pid} has mixed murmur labels")
+    return labels
+
+
+def _stratified_patient_ids(
+    patient_labels: dict[int, int],
+    val_fraction: float,
+    seed: int,
+) -> tuple[set[int], set[int]]:
+    rng = np.random.default_rng(seed)
+    train_ids: set[int] = set()
+    val_ids: set[int] = set()
+    for label in (0, 1):
+        ids = sorted(pid for pid, y in patient_labels.items() if y == label)
+        rng.shuffle(ids)
+        n_val = max(1, int(len(ids) * val_fraction)) if ids else 0
+        val_ids.update(ids[:n_val])
+        train_ids.update(ids[n_val:])
+    return train_ids, val_ids
+
+
+def recording_patient_split(
+    ds: CirCorRecordingMurmurDataset,
+    val_fraction: float = 0.15,
+    seed: int = 0,
+):
+    """Patient-disjoint split for recording-level training."""
+    patient_labels = _patient_labels([(pid, label) for pid, _loc, _wav, label in ds._records])
+    train_ids, val_ids = _stratified_patient_ids(patient_labels, val_fraction, seed)
+    train_idx = [i for i, (pid, *_) in enumerate(ds._records) if pid in train_ids]
+    val_idx = [i for i, (pid, *_) in enumerate(ds._records) if pid in val_ids]
+    return Subset(ds, train_idx), Subset(ds, val_idx)
+
+
+def recording_collate(batch: list[tuple[torch.Tensor, int]]) -> tuple[list[torch.Tensor], torch.Tensor]:
+    recordings = [mel for mel, _ in batch]
+    labels = torch.tensor([label for _, label in batch], dtype=torch.float32)
+    return recordings, labels
+
+
+def aggregate_logits(logits: torch.Tensor, mode: str, topk: int) -> torch.Tensor:
+    if logits.ndim != 1:
+        logits = logits.reshape(-1)
+    if mode == "mean":
+        return logits.mean()
+    if mode == "max":
+        return logits.max()
+    if mode == "topk_mean":
+        k = min(max(1, topk), logits.numel())
+        return logits.topk(k).values.mean()
+    raise ValueError(f"unknown aggregation mode {mode}")
 
 
 def run_epoch(
@@ -80,6 +144,42 @@ def run_epoch(
     return float(np.mean(losses)), auc
 
 
+def run_recording_epoch(
+    model: nn.Module,
+    loader: Iterable,
+    loss_fn: nn.Module,
+    opt: torch.optim.Optimizer | None,
+    dev: torch.device,
+    aggregation: str,
+    topk: int,
+) -> tuple[float, float]:
+    model.train(opt is not None)
+    losses: list[float] = []
+    probs: list[float] = []
+    labels_out: list[float] = []
+    for recordings, labels in loader:
+        labels = labels.to(dev, non_blocking=True)
+        agg_logits: list[torch.Tensor] = []
+        with torch.set_grad_enabled(opt is not None):
+            for mel in recordings:
+                mel = mel.to(dev, non_blocking=True)
+                logits = model(mel)
+                agg_logits.append(aggregate_logits(logits, aggregation, topk))
+            batch_logits = torch.stack(agg_logits)
+            loss = loss_fn(batch_logits, labels)
+            if opt is not None:
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        losses.append(loss.item())
+        probs.extend(torch.sigmoid(batch_logits).detach().cpu().numpy().tolist())
+        labels_out.extend(labels.detach().cpu().numpy().tolist())
+    auc = float("nan")
+    if len(set(labels_out)) == 2:
+        auc = roc_auc_score(labels_out, probs)
+    return float(np.mean(losses)), auc
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, required=True, help="CirCor root (training_data.csv lives here)")
@@ -90,31 +190,72 @@ def main():
     p.add_argument("--out", type=Path, default=Path("runs/last"))
     p.add_argument("--val-fraction", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
+    p.add_argument("--level", choices=["window", "recording"], default="window")
+    p.add_argument("--architecture", choices=["cnn", "cnn_bigru"], default="cnn")
+    p.add_argument("--aggregation", choices=["mean", "topk_mean", "max"], default="mean")
+    p.add_argument("--topk", type=int, default=3, help="k for --aggregation topk_mean")
+    p.add_argument(
+        "--no-cardiac",
+        action="store_true",
+        help="skip legacy cardiac filter; matches current stetho-ui preprocessing",
+    )
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args.out.mkdir(parents=True, exist_ok=True)
 
-    dev = device()
+    dev = device(args.device)
     torch.manual_seed(args.seed)
     log.info("device: %s", dev)
 
-    ds = CirCorMurmurDataset(args.data)
-    log.info("dataset: %d windows | balance: %s", len(ds), ds.class_balance())
-    train_ds, val_ds = patient_split(ds, args.val_fraction, args.seed)
-    log.info("split:  train=%d  val=%d", len(train_ds), len(val_ds))
+    if args.level == "recording":
+        ds = CirCorRecordingMurmurDataset(args.data, apply_cardiac=not args.no_cardiac)
+        log.info("dataset: %d recordings | balance: %s", len(ds), ds.class_balance())
+        train_ds, val_ds = recording_patient_split(ds, args.val_fraction, args.seed)
+        log.info(
+            "split:  train=%d  val=%d  aggregation=%s topk=%d",
+            len(train_ds),
+            len(val_ds),
+            args.aggregation,
+            args.topk,
+        )
+    else:
+        ds = CirCorMurmurDataset(args.data, apply_cardiac=not args.no_cardiac)
+        log.info("dataset: %d windows | balance: %s", len(ds), ds.class_balance())
+        train_ds, val_ds = patient_split(ds, args.val_fraction, args.seed)
+        log.info("split:  train=%d  val=%d", len(train_ds), len(val_ds))
 
     pin = dev.type in ("cuda",)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=pin, drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=pin,
-    )
+    if args.level == "recording":
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.workers,
+            pin_memory=pin,
+            drop_last=True,
+            collate_fn=recording_collate,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=pin,
+            collate_fn=recording_collate,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=pin, drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=pin,
+        )
 
-    model = MurmurCNN().to(dev)
+    model = build_model(args.architecture).to(dev)
     log.info("params: %d", count_parameters(model))
     # Class-balanced loss: pos_weight = N_neg / N_pos so the minority
     # (murmur-present) class gets a proportional gradient pull.
@@ -125,20 +266,40 @@ def main():
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    best_auc = -1.0
+    best_auc = float("-inf")
+    saved_best = False
     history = []
     for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev)
-        va_loss, va_auc = run_epoch(model, val_loader, loss_fn, None, dev)
+        if args.level == "recording":
+            tr_loss, tr_auc = run_recording_epoch(
+                model, train_loader, loss_fn, opt, dev, args.aggregation, args.topk
+            )
+            va_loss, va_auc = run_recording_epoch(
+                model, val_loader, loss_fn, None, dev, args.aggregation, args.topk
+            )
+        else:
+            tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev)
+            va_loss, va_auc = run_epoch(model, val_loader, loss_fn, None, dev)
         history.append({"epoch": epoch, "tr_loss": tr_loss, "tr_auc": tr_auc, "va_loss": va_loss, "va_auc": va_auc})
         log.info("ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f", epoch, tr_loss, tr_auc, va_loss, va_auc)
-        if va_auc > best_auc:
-            best_auc = va_auc
+        torch.save(model.state_dict(), args.out / "last.pt")
+        if np.isfinite(va_auc) and va_auc > best_auc or not saved_best:
+            if np.isfinite(va_auc):
+                best_auc = va_auc
+            saved_best = True
             torch.save(model.state_dict(), args.out / "best.pt")
-            (args.out / "best_meta.json").write_text(json.dumps({"epoch": epoch, "val_auc": va_auc}))
+            (args.out / "best_meta.json").write_text(json.dumps({
+                "epoch": epoch,
+                "val_auc": va_auc,
+                "level": args.level,
+                "architecture": args.architecture,
+                "aggregation": args.aggregation if args.level == "recording" else None,
+                "topk": args.topk if args.level == "recording" else None,
+            }))
 
     (args.out / "history.json").write_text(json.dumps(history, indent=2))
-    log.info("best val AUC: %.3f → %s/best.pt", best_auc, args.out)
+    best_auc_msg = f"{best_auc:.3f}" if np.isfinite(best_auc) else "nan"
+    log.info("best val AUC: %s → %s/best.pt", best_auc_msg, args.out)
 
 
 if __name__ == "__main__":

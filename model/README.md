@@ -38,7 +38,8 @@ model/
 ├── openstetho_model/
 │   ├── __init__.py
 │   ├── preprocess.py    # 4 kHz resample, cardiac biquads, mel-spec
-│   └── dataset.py       # CirCor 2022 PyTorch Dataset
+│   ├── dataset.py       # CirCor 2022 PyTorch Dataset
+│   └── bench_murmur.py  # CoreML/PyTorch/ONNX murmur benchmark
 ├── tests/
 │   └── test_preprocess.py
 ├── pyproject.toml
@@ -68,11 +69,123 @@ the model to the lower half of the FFT (heart-sound band) and match
 uv run --project model python -m pytest model/tests -q
 ```
 
-## Next steps (Phase 3 task list)
+## Murmur training
 
-- [x] step 2 — Python env via uv (this folder)
-- [x] step 3 — preprocess pipeline
-- [ ] step 4 — Apple `MLSoundClassifier` baseline (CreateML, ~10 min)
-- [ ] step 5 — custom PyTorch model (MobileNetV3-tiny / AST-mini) on MPS
-- [ ] step 6 — `coremltools.convert` → `.mlpackage`, ANE verify
-- [ ] step 7 — wire into `stetho-ui` via `objc2-core-ml`
+The default path trains per 4-second window. For the current deployment
+shape, prefer recording-level multiple-instance training so the loss
+matches recording/session-level aggregation:
+
+```bash
+uv run --project model python -m openstetho_model.train \
+    --data data/circor \
+    --level recording \
+    --aggregation mean \
+    --no-cardiac \
+    --epochs 30 \
+    --batch-size 16 \
+    --out model/runs/murmur_recording_mean_v1
+```
+
+Use `--aggregation topk_mean --topk 3` when a murmur should be learned
+from only the strongest few windows in each recording.
+
+Experimental temporal-head training is available with `--architecture
+cnn_bigru`. It is a PyTorch research path, not an exported ANE/Core ML
+deployment path yet:
+
+```bash
+uv run --project model python -m openstetho_model.train \
+    --data $CIRCOR_ROOT \
+    --level recording \
+    --architecture cnn_bigru \
+    --aggregation mean \
+    --no-cardiac \
+    --epochs 5 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --out model/runs/murmur_cnn_bigru_mean_full_v1
+```
+
+## Murmur benchmark
+
+Use `bench_murmur` to compare the current exported murmur detector against
+a PyTorch checkpoint and/or an ONNX baseline on the same CirCor patient
+split. The ONNX model must accept the same log-mel tensor contract as
+`MurmurCNN`: `(1, 1, 62, 32)` float32, one logit or probability output.
+By default the benchmark skips the legacy cardiac filter to match the
+current `stetho-ui` inference path; pass `--apply-cardiac` only when
+benchmarking an older model trained with that filter.
+
+```bash
+uv run --project model python -m openstetho_model.bench_murmur \
+    --data data/circor \
+    --coreml model/runs/release-circor-v1/MurmurCNN.mlpackage \
+    --onnx path/to/baseline.onnx \
+    --split val \
+    --out model/runs/murmur_bench/predictions.csv \
+    --sweep-out model/runs/murmur_bench/threshold_sweep.csv \
+    --json model/runs/murmur_bench/report.json
+```
+
+The JSON report includes threshold summaries for window-level scores and
+recording-level aggregations (`max`, `mean`, `top3_mean` by default). The
+optional sweep CSV writes every threshold point for plotting sensitivity /
+specificity tradeoffs.
+
+The benchmark also supports the 2025 Scientific Reports-style vote
+experiment: overlapping 2.5-second windows, 1.25-second hop, and recording
+positive if at least `k` windows exceed a window threshold. For the current
+fixed-shape Core ML package, pass `--pad-to-model-window` because the
+exported model expects 4-second `(1, 1, 62, 32)` features:
+
+```bash
+uv run --project model python -m openstetho_model.bench_murmur \
+    --data $CIRCOR_ROOT \
+    --coreml model/runs/release-circor-v1/MurmurCNN.mlpackage \
+    --split all \
+    --bench-window-seconds 2.5 \
+    --bench-hop-seconds 1.25 \
+    --max-recording-seconds 10 \
+    --pad-to-model-window \
+    --bandpass 25 700 \
+    --vote-thresholds 0.3,0.4,0.49331352,0.5,0.6,0.7,0.8 \
+    --vote-counts 1,2,3,4,5,6,7 \
+    --json model/runs/murmur_bench/full_all_coreml_vote_2p5_bandpass25_700_report.json
+```
+
+See `docs/murmur_detector_benchmark.md` for the latest Core ML, vote-rule,
+bandpass, and CNN+BiGRU results.
+
+Current app-facing post-processing tune for the exported `MurmurCNN`: use
+recording-level mean aggregation and threshold at `0.49331352`. This is the
+running-session threshold currently wired into `stetho-ui`; the full
+benchmark note above also records stricter best-F1 operating points for
+offline comparison.
+
+## Current roadmap — S3 validation + annotation
+
+The old Phase 3 CreateML/Core ML/UI checklist is complete or superseded:
+the repository now has a PyTorch S3 detector, Core ML export, and parallel
+Murmur/S3 inference in `stetho-ui`. The remaining bottleneck is real
+cycle-level S3 ground truth.
+
+- [x] Train/export `S3CNN_v2` from synthetic S3 augmentation.
+- [x] Package `MurmurCNN.mlpackage` and `S3CNN_v2.mlpackage` together for
+      `stetho-ui`.
+- [x] Wire `stetho-ui` to load the S3 model opportunistically next to the
+      murmur model and display both probabilities.
+- [x] Validate `runs/s3_circor_v10/best.pt` on small cardiologist-labeled
+      public teaching libraries; see `docs/real_validation_results.md`.
+- [x] Generate an initial v10 annotation export:
+      `model/runs/s3_circor_v10/annotation_export`.
+- [ ] Build the clinician annotation viewer described in
+      `docs/s3_annotation_protocol.md`: audio playback, S1/S2 markers,
+      mel image, and `label_s3 ∈ {0, 1, 9}` capture.
+- [ ] Run a 60-cycle pilot with two independent raters, then compute kappa
+      with `openstetho_model.compute_kappa`.
+- [ ] Scale the stratified annotation export to the target batch size once
+      the viewer/protocol are usable.
+- [ ] Adjudicate disagreements and write `data/s3_circor_labels.csv`.
+- [ ] Add a real-label S3 cycle dataset and fine-tune from the synthetic
+      checkpoint.
