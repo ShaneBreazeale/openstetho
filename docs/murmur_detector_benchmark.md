@@ -405,6 +405,10 @@ CV artifacts:
 - `model/runs/murmur_cv_scattering_5s_v1/oof_predictions.csv`
 - `model/runs/murmur_cv_logmel_5s_focal_sens_v1/cv_report.json`
 - `model/runs/murmur_cv_logmel_5s_focal_sens_v1/oof_predictions.csv`
+- `model/runs/murmur_cv_logmel_5s_bce_select_f1_v1/cv_report.json`
+- `model/runs/murmur_cv_logmel_5s_bce_select_f1_v1/oof_predictions.csv`
+- `model/runs/murmur_cv_logmel_5s_bce_select_youden_v1/cv_report.json`
+- `model/runs/murmur_cv_logmel_5s_bce_select_youden_v1/oof_predictions.csv`
 
 Results:
 
@@ -414,6 +418,7 @@ Results:
 | mfcc 5s | 0.854 | 0.022 | 0.800 | 0.557 | 0.573 | 0.898 | 0.582 |
 | scattering 5s + 1D-CNN | 0.522 | 0.069 | 0.517 | 0.298 | 0.998 | 0.002 | 0.340 |
 | logmel 5s + focal sensitivity tune | 0.783 | 0.023 | 0.748 | 0.790 | 0.408 | 0.938 | 0.494 |
+| logmel 5s + BCE F1/Youden selection | 0.825 | 0.016 | 0.817 | 0.822 | 0.538 | 0.940 | 0.607 |
 
 Fold AUROCs:
 
@@ -423,6 +428,7 @@ Fold AUROCs:
 | mfcc 5s | 0.881 | 0.866 | 0.849 | 0.862 | 0.815 |
 | scattering 5s + 1D-CNN | 0.565 | 0.469 | 0.462 | 0.637 | 0.476 |
 | logmel 5s + focal sensitivity tune | 0.744 | 0.812 | 0.774 | 0.800 | 0.785 |
+| logmel 5s + BCE F1/Youden selection | 0.831 | 0.849 | 0.819 | 0.822 | 0.802 |
 
 Interpretation from CV: MFCC is more consistent fold-by-fold and has the
 better mean validation AUROC, but pooled out-of-fold AUROC/F1 does not beat
@@ -448,6 +454,8 @@ Leave-one-fold-out probability calibration and threshold transfer:
 | mfcc 5s | Platt calibrated | 0.780 | 0.127 | 0.029 | 0.566 | 0.574 | 0.883 | 0.275 |
 | scattering 5s + 1D-CNN | raw | 0.517 | 0.254 | 0.296 | 0.325 | 0.800 | 0.196 | 0.323 |
 | scattering 5s + 1D-CNN | Platt calibrated | 0.473 | 0.164 | 0.015 | 0.319 | 0.782 | 0.199 | 0.187 |
+| logmel 5s + BCE F1/Youden selection | Platt calibrated | 0.814 | 0.110 | 0.040 | 0.597 | 0.525 | 0.940 | 0.437 |
+| logmel 5s + BCE F1/Youden selection | isotonic calibrated | 0.805 | 0.109 | 0.021 | 0.597 | 0.525 | 0.940 | 0.368 |
 
 Platt calibration improves Brier score and ECE for the 5s log-mel and MFCC
 models, but it does not recover sensitivity/specificity tradeoff by itself.
@@ -456,6 +464,39 @@ probability calibration keeps the best-F1 decisions effectively unchanged
 for log-mel and MFCC. The useful calibrated headline is therefore:
 log-mel remains slightly ahead (`F1=0.569`, sensitivity `0.568`,
 specificity `0.890`) and has the better pooled ranking after calibration.
+
+Checkpoint selection by validation F1 or Youden-J with the standard BCE
+loss is a positive result. Both selection metrics picked the same best epoch
+per fold in the seed-0 run, so the resulting reports are identical:
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT \
+    --architecture cnn_bigru \
+    --feature-mode logmel \
+    --window-seconds 5 \
+    --folds 5 \
+    --epochs 8 \
+    --batch-size 16 \
+    --workers 0 \
+    --device cpu \
+    --no-cardiac \
+    --loss bce \
+    --select-metric f1 \
+    --lr-scheduler plateau \
+    --plateau-patience 1 \
+    --plateau-factor 0.5 \
+    --early-stopping-patience 2 \
+    --out model/runs/murmur_cv_logmel_5s_bce_select_f1_v1
+```
+
+Compared with the earlier AUROC-selected 5s log-mel baseline, this improves
+pooled OoF AUROC (`0.817` vs `0.809`) and deployable Platt-calibrated
+best-F1 transfer (`0.597` vs `0.569`). The specificity-oriented operating
+point is also better with isotonic calibration: F1 `0.601`, sensitivity
+`0.545`, specificity `0.931`. The high-sensitivity operating point is still
+not good enough for screening: Platt transfer gets sensitivity `0.794`,
+specificity `0.642`, F1 `0.498`.
 
 The sensitivity-weighted run used focal BCE, 1.5x positive loss weight,
 1.5x positive replacement sampling, and F1-based checkpoint selection:
@@ -514,8 +555,12 @@ architecture from scratch.
 
 - Do not replace the app model with the earlier `murmur_recording_top3_v1`
   checkpoint; its full benchmark AUROC was below 0.5.
-- Keep the released log-mel CNN+BiGRU as the app-facing murmur checkpoint.
-  The 5s MFCC single-split result did not hold up as a pooled OoF
+- Treat the 5s log-mel CNN+BiGRU with BCE loss and F1/Youden checkpoint
+  selection as the current research lead. It has the best pooled OoF AUROC
+  and best transferred F1 so far.
+- Keep the released app-facing checkpoint unchanged until the 5s log-mel
+  CNN+BiGRU path has an export/deployment plan.
+- The 5s MFCC single-split result did not hold up as a pooled OoF
   improvement under patient-level CV.
 - Treat 5s MFCC-only as a useful representation candidate because its fold
   AUROC is consistently strong, but do not promote it without calibration.
@@ -532,6 +577,6 @@ architecture from scratch.
 - Do not promote the first focal sensitivity-weighted log-mel run. It hurts
   AUROC and transferred-threshold F1 despite improving some raw recall
   operating points.
-- Next CNN+BiGRU work should isolate sensitivity knobs one at a time:
-  F1/Youden checkpoint selection without focal loss, then smaller positive
-  sampling or positive-weight multipliers if needed.
+- Next CNN+BiGRU work should focus on export/deployment feasibility for the
+  BCE F1/Youden-selected 5s log-mel model, or on a smaller sensitivity
+  nudge that does not damage ranking.

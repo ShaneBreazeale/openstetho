@@ -143,8 +143,10 @@ choices to the held-out fold. Use that section for calibrated Brier/ECE and
 threshold-transfer metrics; the pooled `best_f1` threshold is optimistic.
 The first combined focal / positive-weight / positive-sampling run improved
 some raw sensitivity operating points but reduced pooled AUROC and
-transferred-threshold F1, so keep the original 5-second log-mel CNN+BiGRU as
-the current lead.
+transferred-threshold F1. The current research lead is the 5-second log-mel
+CNN+BiGRU trained with standard BCE and selected by validation F1 or
+Youden-J; both selection policies picked the same epochs in the seed-0
+5-fold run and improved Platt-calibrated transferred best-F1 to `0.597`.
 
 ```bash
 uv run --project model python -m openstetho_model.cv_murmur \
