@@ -26,12 +26,21 @@ loop that can support future model development on properly matched data.
 Model artifacts are intentionally not committed to git. Two Core ML
 packages are produced by the training pipeline:
 
-* `MurmurCNN.mlpackage` (~300 KB state dict, ~1 MB mlpackage) — original
-  murmur classifier from CirCor 2022.
+* `MurmurCNN.mlpackage` (~450 KB mlpackage in the current release) —
+  experimental CNN+BiGRU murmur classifier trained on CirCor 2022.
 * `S3CNN_v2.mlpackage` (~1.2 MB mlpackage) — third-heart-sound detector
   with S2-anchored cycle-level inference. See
   [`docs/real_validation_results.md`](docs/real_validation_results.md)
   for the cardiologist-labeled validation summary.
+
+Latest model bundle:
+[`v0.3.0-murmur-bigru`](https://github.com/ShaneBreazeale/openstetho/releases/tag/v0.3.0-murmur-bigru)
+publishes `MurmurCNN.mlpackage.zip`, containing the CNN+BiGRU murmur model
+and the `S3CNN_v2` sibling. On the full CirCor benchmark, the CNN+BiGRU
+recording-mean murmur model reached AUROC 0.868 and best-F1 0.702
+(sensitivity 0.634, specificity 0.956). See
+[`docs/murmur_detector_benchmark.md`](docs/murmur_detector_benchmark.md)
+for commands, thresholds, and caveats.
 
 `stetho-ui` runs both engines in parallel — it loads
 `MurmurCNN.mlpackage` from the configured download dir, then
@@ -42,7 +51,8 @@ S3 probabilities appear side by side in the top status bar.
 Set `OPENSTETHO_MODEL_DOWNLOAD_URL` to override the default release URL
 and `OPENSTETHO_MODEL_DOWNLOAD_DIR` to override the local destination.
 The default button URL works after a GitHub release asset named
-`MurmurCNN.mlpackage.zip` exists. Package one or both models with:
+`MurmurCNN.mlpackage.zip` exists; the current latest release already
+provides that asset. Package one or both models with:
 
 ```bash
 # murmur only
@@ -50,7 +60,7 @@ scripts/package_model_release.sh model/runs/v1/MurmurCNN.mlpackage
 
 # murmur + S3 (recommended for current releases)
 scripts/package_model_release.sh \
-    model/runs/release-circor-v1/MurmurCNN.mlpackage \
+    model/runs/release-circor-v2/MurmurCNN.mlpackage \
     model/runs/s3_circor_v10/S3CNN_v2.mlpackage
 ```
 
