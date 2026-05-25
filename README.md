@@ -93,6 +93,10 @@ uv run python -m openstetho_model.export --checkpoint runs/v1/best.pt \
     --out runs/v1/MurmurCNN.mlpackage --target macOS13 --verify
 ```
 
+Experimental CNN+BiGRU murmur checkpoints can be exported with
+`--architecture cnn_bigru`; keep the package name `MurmurCNN.mlpackage`
+when building GUI-downloadable release assets.
+
 ## Provenance + license
 
 DSP, protocol observations, and dataset attributions are documented

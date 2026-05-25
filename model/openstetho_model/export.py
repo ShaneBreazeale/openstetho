@@ -1,4 +1,4 @@
-"""Export a trained MurmurCNN checkpoint to a Core ML `.mlpackage`.
+"""Export a trained murmur checkpoint to a Core ML `.mlpackage`.
 
 The package targets the Apple Neural Engine: all ops used in MurmurCNN
 (Conv2D / BatchNorm / ReLU / AvgPool / Linear / Dropout) are ANE-supported,
@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import coremltools as ct
 
-from .model import MurmurCNN
+from .model import MurmurCNN, MurmurCNNBiGRU
 from .preprocess import N_MELS
 
 log = logging.getLogger("export")
@@ -47,26 +47,36 @@ TARGETS = {
 }
 
 
-def load_model(checkpoint: Path) -> MurmurCNN:
-    model = MurmurCNN()
+def load_model(checkpoint: Path, architecture: str) -> torch.nn.Module:
+    if architecture == "cnn":
+        model = MurmurCNN()
+    elif architecture == "cnn_bigru":
+        model = MurmurCNNBiGRU()
+    else:
+        raise ValueError(f"unknown architecture {architecture}")
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
     return model
 
 
-def trace_model(model: MurmurCNN) -> torch.jit.ScriptModule:
+def trace_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
     example = torch.zeros(1, 1, N_FRAMES, N_MELS, dtype=torch.float32)
     return torch.jit.trace(model, example)
 
 
-def export(checkpoint: Path, out_path: Path, target_key: str = "iOS17") -> Path:
+def export(
+    checkpoint: Path,
+    out_path: Path,
+    architecture: str = "cnn",
+    target_key: str = "iOS17",
+) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if target_key not in TARGETS:
         raise ValueError(f"unknown target {target_key}; valid: {sorted(TARGETS)}")
 
     log.info("loading checkpoint %s", checkpoint)
-    model = load_model(checkpoint)
+    model = load_model(checkpoint, architecture)
     log.info("tracing")
     traced = trace_model(model)
 
@@ -80,10 +90,11 @@ def export(checkpoint: Path, out_path: Path, target_key: str = "iOS17") -> Path:
         minimum_deployment_target=TARGETS[target_key],
     )
 
-    mlmodel.short_description = "MurmurCNN - heart-sound murmur classifier (binary)"
+    mlmodel.short_description = f"{architecture} heart-sound murmur classifier (binary)"
     mlmodel.author = "Shane Breazeale"
     mlmodel.license = "Apache-2.0 code; model trained on PhysioNet CirCor 2022 (ODC-By 1.0)"
-    mlmodel.version = "0.1.0"
+    mlmodel.version = "0.2.0"
+    mlmodel.user_defined_metadata["architecture"] = architecture
     if hasattr(mlmodel, "input_description"):
         mlmodel.input_description[INPUT_NAME] = (
             f"Log-mel spectrogram, shape (1, 1, {N_FRAMES}, {N_MELS}). "
@@ -99,13 +110,13 @@ def export(checkpoint: Path, out_path: Path, target_key: str = "iOS17") -> Path:
     return out_path
 
 
-def verify(checkpoint: Path, mlpackage: Path) -> dict:
+def verify(checkpoint: Path, mlpackage: Path, architecture: str = "cnn") -> dict:
     """Run both PyTorch and Core ML on the same random input. Reports the
     max absolute and mean absolute difference of the logit output."""
     rng = np.random.default_rng(0)
     x_np = rng.standard_normal((1, 1, N_FRAMES, N_MELS)).astype(np.float32)
 
-    model = load_model(checkpoint)
+    model = load_model(checkpoint, architecture)
     with torch.no_grad():
         y_torch = model(torch.from_numpy(x_np)).numpy()
 
@@ -129,16 +140,17 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--architecture", choices=["cnn", "cnn_bigru"], default="cnn")
     p.add_argument("--target", default="iOS17", help=f"deployment target; one of {sorted(TARGETS)}")
     p.add_argument("--verify", action="store_true", help="torch vs coreml output check")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    export(args.checkpoint, args.out, args.target)
+    export(args.checkpoint, args.out, args.architecture, args.target)
 
     if args.verify:
         log.info("running parity check")
-        report = verify(args.checkpoint, args.out)
+        report = verify(args.checkpoint, args.out, args.architecture)
         print(json.dumps(report, indent=2))
 
 
