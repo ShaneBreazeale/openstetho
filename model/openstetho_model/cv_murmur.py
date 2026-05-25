@@ -10,6 +10,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
@@ -27,6 +30,10 @@ from .train import (
 )
 
 log = logging.getLogger("cv_murmur")
+PROB_EPS = 1e-6
+CALIBRATION_METHODS = ("none", "platt", "isotonic")
+THRESHOLD_KEYS = ("best_f1", "best_youden_j")
+THRESHOLD_METRICS = {"best_f1": "f1", "best_youden_j": "youden_j"}
 
 
 def stratified_patient_folds(
@@ -211,14 +218,186 @@ def predict_recordings(
     return out
 
 
+def clipped_probs(probs: np.ndarray) -> np.ndarray:
+    return np.clip(np.asarray(probs, dtype=np.float64), PROB_EPS, 1.0 - PROB_EPS)
+
+
+def prob_logits(probs: np.ndarray) -> np.ndarray:
+    probs = clipped_probs(probs)
+    return np.log(probs / (1.0 - probs))
+
+
+def expected_calibration_error(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    n_bins: int = 10,
+) -> float:
+    labels = np.asarray(labels, dtype=np.int64)
+    probs = clipped_probs(probs)
+    if labels.size == 0:
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo = edges[i]
+        hi = edges[i + 1]
+        if i == n_bins - 1:
+            mask = (probs >= lo) & (probs <= hi)
+        else:
+            mask = (probs >= lo) & (probs < hi)
+        if not mask.any():
+            continue
+        ece += float(mask.mean()) * abs(float(probs[mask].mean()) - float(labels[mask].mean()))
+    return ece
+
+
+def probability_metrics(labels: np.ndarray, probs: np.ndarray) -> dict[str, float]:
+    labels = np.asarray(labels, dtype=np.int64)
+    probs = clipped_probs(probs)
+    return {
+        "auroc": float(roc_auc_score(labels, probs)) if len(set(labels.tolist())) == 2 else float("nan"),
+        "brier": float(np.mean((probs - labels) ** 2)) if labels.size else float("nan"),
+        "ece_10": expected_calibration_error(labels, probs, n_bins=10),
+    }
+
+
+def binary_metrics_from_predictions(
+    labels: np.ndarray,
+    pred: np.ndarray,
+    scores: np.ndarray,
+) -> dict[str, float]:
+    labels = np.asarray(labels, dtype=np.int64)
+    pred = np.asarray(pred, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    tp = int(((pred == 1) & (labels == 1)).sum())
+    fp = int(((pred == 1) & (labels == 0)).sum())
+    tn = int(((pred == 0) & (labels == 0)).sum())
+    fn = int(((pred == 0) & (labels == 1)).sum())
+    out = probability_metrics(labels, scores)
+    out.update({
+        "n": int(labels.size),
+        "positives": int(labels.sum()),
+        "accuracy": (tp + tn) / max(labels.size, 1),
+        "sensitivity": tp / max(tp + fn, 1),
+        "specificity": tn / max(tn + fp, 1),
+        "precision": tp / max(tp + fp, 1),
+        "f1": 0.0 if 2 * tp + fp + fn == 0 else 2 * tp / (2 * tp + fp + fn),
+        "youden_j": (tp / max(tp + fn, 1)) + (tn / max(tn + fp, 1)) - 1.0,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    })
+    return out
+
+
+def calibrate_probs(
+    train_labels: np.ndarray,
+    train_probs: np.ndarray,
+    val_probs: np.ndarray,
+    method: str,
+) -> np.ndarray:
+    train_labels = np.asarray(train_labels, dtype=np.int64)
+    train_probs = clipped_probs(train_probs)
+    val_probs = clipped_probs(val_probs)
+    if method == "none" or len(set(train_labels.tolist())) < 2:
+        return val_probs
+    if method == "platt":
+        model = LogisticRegression(random_state=0, solver="liblinear")
+        model.fit(prob_logits(train_probs).reshape(-1, 1), train_labels)
+        return model.predict_proba(prob_logits(val_probs).reshape(-1, 1))[:, 1].astype(np.float64)
+    if method == "isotonic":
+        model = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        model.fit(train_probs, train_labels)
+        return np.asarray(model.transform(val_probs), dtype=np.float64)
+    raise ValueError(f"unknown calibration method {method!r}; valid: {CALIBRATION_METHODS}")
+
+
+def calibration_curve_points(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    n_bins: int = 10,
+) -> list[dict[str, float]]:
+    labels = np.asarray(labels, dtype=np.int64)
+    probs = clipped_probs(probs)
+    if labels.size == 0:
+        return []
+    prob_true, prob_pred = calibration_curve(labels, probs, n_bins=n_bins, strategy="uniform")
+    return [
+        {"mean_predicted_probability": float(x), "fraction_positive": float(y)}
+        for x, y in zip(prob_pred, prob_true)
+    ]
+
+
 def summarize(labels: np.ndarray, probs: np.ndarray, threshold: float) -> dict[str, object]:
     rows = sweep_thresholds(labels, probs)
     return {
         "threshold": binary_metrics(labels, probs, threshold),
         "best_f1": best_by(rows, "f1"),
         "best_youden_j": best_by(rows, "youden_j"),
-        "auroc": float(roc_auc_score(labels, probs)) if len(set(labels.tolist())) == 2 else float("nan"),
+        **probability_metrics(labels, probs),
+        "calibration_curve_10": calibration_curve_points(labels, probs, n_bins=10),
     }
+
+
+def cross_fold_calibration_report(
+    folds: np.ndarray,
+    labels: np.ndarray,
+    probs: np.ndarray,
+) -> dict[str, object]:
+    """Fit calibration/threshold choices on other folds, apply to each fold."""
+    folds = np.asarray(folds, dtype=np.int64)
+    labels = np.asarray(labels, dtype=np.int64)
+    probs = clipped_probs(probs)
+    unique_folds = sorted(set(folds.tolist()))
+    report: dict[str, object] = {}
+    for method in CALIBRATION_METHODS:
+        calibrated = np.zeros_like(probs, dtype=np.float64)
+        threshold_predictions = {
+            key: np.zeros_like(labels, dtype=np.int64)
+            for key in THRESHOLD_KEYS
+        }
+        fold_rows: list[dict[str, object]] = []
+        for fold in unique_folds:
+            val_mask = folds == fold
+            train_mask = ~val_mask
+            train_labels = labels[train_mask]
+            train_probs = probs[train_mask]
+            val_probs = probs[val_mask]
+            train_calibrated = calibrate_probs(train_labels, train_probs, train_probs, method)
+            val_calibrated = calibrate_probs(train_labels, train_probs, val_probs, method)
+            calibrated[val_mask] = val_calibrated
+
+            train_sweep = sweep_thresholds(train_labels, train_calibrated)
+            row: dict[str, object] = {"fold": int(fold)}
+            for key in THRESHOLD_KEYS:
+                threshold = float(best_by(train_sweep, THRESHOLD_METRICS[key])["threshold"])
+                threshold_predictions[key][val_mask] = (val_calibrated >= threshold).astype(np.int64)
+                row[f"{key}_threshold"] = threshold
+            row.update(probability_metrics(labels[val_mask], val_calibrated))
+            fold_rows.append(row)
+
+        method_report: dict[str, object] = {
+            "probability": {
+                **probability_metrics(labels, calibrated),
+                "calibration_curve_10": calibration_curve_points(labels, calibrated, n_bins=10),
+            },
+            "threshold_transfer": {},
+            "folds": fold_rows,
+        }
+        for key, pred in threshold_predictions.items():
+            metrics = binary_metrics_from_predictions(labels, pred, calibrated)
+            thresholds = np.asarray([float(row[f"{key}_threshold"]) for row in fold_rows], dtype=np.float64)
+            metrics.update({
+                "threshold_policy": key,
+                "threshold_mean": float(thresholds.mean()),
+                "threshold_std": float(thresholds.std()),
+                "threshold_min": float(thresholds.min()),
+                "threshold_max": float(thresholds.max()),
+            })
+            method_report["threshold_transfer"][key] = metrics  # type: ignore[index]
+        report[method] = method_report
+    return report
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -279,7 +458,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fold_reports.append(fold_report)
 
     labels = np.asarray([row["label"] for row in prediction_rows], dtype=np.int64)
+    prediction_folds = np.asarray([row["fold"] for row in prediction_rows], dtype=np.int64)
     probs = np.asarray([row["prob"] for row in prediction_rows], dtype=np.float64)
+    calibration_report = cross_fold_calibration_report(prediction_folds, labels, probs)
     report = {
         "data": str(args.data),
         "feature_mode": args.feature_mode,
@@ -300,6 +481,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "positives": int(labels.sum()),
         "fold_reports": fold_reports,
         "oof": summarize(labels, probs, args.threshold),
+        "cross_fold_calibration": calibration_report,
         "fold_val_auc_mean": float(np.mean([r["best_val_auc"] for r in fold_reports])),
         "fold_val_auc_std": float(np.std([r["best_val_auc"] for r in fold_reports])),
     }

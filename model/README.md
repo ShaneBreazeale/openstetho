@@ -128,6 +128,12 @@ initial wavelet-scattering + 1D-CNN run was a negative result in this
 pipeline, with pooled out-of-fold AUROC near chance, so keep it as a
 research branch rather than a model candidate.
 
+`cv_murmur` also writes a `cross_fold_calibration` report. For each held-out
+fold it fits Platt/isotonic probability calibration and best-F1 / Youden-J
+thresholds on the other folds' out-of-fold predictions, then applies those
+choices to the held-out fold. Use that section for calibrated Brier/ECE and
+threshold-transfer metrics; the pooled `best_f1` threshold is optimistic.
+
 ```bash
 uv run --project model python -m openstetho_model.cv_murmur \
     --data $CIRCOR_ROOT \

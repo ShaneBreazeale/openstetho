@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
 
-from openstetho_model.cv_murmur import stratified_patient_folds
+from openstetho_model.cv_murmur import (
+    calibrate_probs,
+    cross_fold_calibration_report,
+    expected_calibration_error,
+    stratified_patient_folds,
+)
 from openstetho_model.dataset import window_hop_samples
 from openstetho_model.train import aggregate_logits, build_model, recording_collate
 
@@ -64,3 +70,34 @@ def test_stratified_patient_folds_keep_each_patient_once():
     folds = stratified_patient_folds(labels, n_folds=5, seed=0)
     assert sorted(pid for fold in folds for pid in fold) == list(range(20))
     assert all({labels[pid] for pid in fold} == {0, 1} for fold in folds)
+
+
+def test_expected_calibration_error_is_low_for_matched_bins():
+    labels = np.asarray([0, 0, 1, 1])
+    probs = np.asarray([0.0, 0.0, 1.0, 1.0])
+    assert expected_calibration_error(labels, probs, n_bins=2) < 1e-5
+
+
+def test_calibrate_probs_single_class_train_falls_back_to_identity():
+    train_labels = np.asarray([0, 0, 0])
+    train_probs = np.asarray([0.1, 0.2, 0.3])
+    val_probs = np.asarray([0.4, 0.6])
+    np.testing.assert_allclose(
+        calibrate_probs(train_labels, train_probs, val_probs, "platt"),
+        val_probs,
+    )
+
+
+def test_cross_fold_calibration_reports_transfer_metrics():
+    folds = np.asarray([1, 1, 2, 2, 3, 3, 4, 4])
+    labels = np.asarray([0, 1, 0, 1, 0, 1, 0, 1])
+    probs = np.asarray([0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6])
+    report = cross_fold_calibration_report(folds, labels, probs)
+
+    assert set(report) == {"none", "platt", "isotonic"}
+    none_report = report["none"]
+    assert none_report["probability"]["auroc"] == 1.0
+    assert set(none_report["threshold_transfer"]) == {"best_f1", "best_youden_j"}
+    assert none_report["threshold_transfer"]["best_f1"]["f1"] > 0.8
+    assert "threshold_mean" in none_report["threshold_transfer"]["best_f1"]
+    assert len(none_report["folds"]) == 4

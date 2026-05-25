@@ -428,6 +428,31 @@ not another single split; it is per-fold threshold calibration, probability
 calibration, or a training objective that gives better cross-fold score
 alignment.
 
+The CV runner now also reports deployable cross-fold calibration metrics.
+For each held-out fold, it fits threshold and probability calibration only
+on the other folds' out-of-fold predictions, then applies those choices to
+the held-out fold. This is stricter than the pooled `best_f1` rows above,
+which pick a single threshold after seeing all out-of-fold labels.
+
+Leave-one-fold-out probability calibration and threshold transfer:
+
+| feature | probability view | AUROC | Brier | ECE-10 | transferred best-F1 F1 | sensitivity | specificity | mean threshold |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| logmel 5s | raw | 0.809 | 0.134 | 0.121 | 0.569 | 0.568 | 0.890 | 0.543 |
+| logmel 5s | Platt calibrated | 0.803 | 0.114 | 0.036 | 0.569 | 0.568 | 0.890 | 0.308 |
+| mfcc 5s | raw | 0.800 | 0.145 | 0.143 | 0.566 | 0.574 | 0.883 | 0.549 |
+| mfcc 5s | Platt calibrated | 0.780 | 0.127 | 0.029 | 0.566 | 0.574 | 0.883 | 0.275 |
+| scattering 5s + 1D-CNN | raw | 0.517 | 0.254 | 0.296 | 0.325 | 0.800 | 0.196 | 0.323 |
+| scattering 5s + 1D-CNN | Platt calibrated | 0.473 | 0.164 | 0.015 | 0.319 | 0.782 | 0.199 | 0.187 |
+
+Platt calibration improves Brier score and ECE for the 5s log-mel and MFCC
+models, but it does not recover sensitivity/specificity tradeoff by itself.
+Because the threshold is selected per fold on the other folds, monotonic
+probability calibration keeps the best-F1 decisions effectively unchanged
+for log-mel and MFCC. The useful calibrated headline is therefore:
+log-mel remains slightly ahead (`F1=0.569`, sensitivity `0.568`,
+specificity `0.890`) and has the better pooled ranking after calibration.
+
 The simple wavelet-scattering implementation is a negative result in this
 pipeline. It uses Kymatio WST coefficients (`J=8`, `Q=4`) from 5-second
 windows and a small 1D-CNN, but pooled OoF AUROC is near chance. Do not
@@ -452,5 +477,9 @@ architecture from scratch.
 - Use recording-level mean aggregation as the primary decision rule.
 - Keep vote-count sweeps in the benchmark for sensitivity/specificity
   exploration, especially once a model is trained natively on 2.5 s windows.
-- Next CNN+BiGRU work should focus on per-fold threshold calibration,
-  probability calibration, and reporting calibrated CV metrics.
+- Use the new `cross_fold_calibration` section in `cv_report.json` for model
+  selection. It reports Brier/ECE plus fold-held-out threshold transfer, so
+  it is less optimistic than pooled best-F1 threshold selection.
+- Next CNN+BiGRU work should focus on changing the training objective or
+  sampling strategy to improve sensitivity at acceptable specificity; Platt
+  calibration improves probability quality but not the underlying ranking.
