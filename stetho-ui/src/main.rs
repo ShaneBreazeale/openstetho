@@ -32,6 +32,40 @@ const SPECTROGRAM_FRAMES: usize = 128;
 const MURMUR_RECORDING_MEAN_THRESHOLD: f32 = 0.49331352;
 const DEFAULT_MODEL_DOWNLOAD_URL: &str =
     "https://github.com/ShaneBreazeale/openstetho/releases/latest/download/MurmurCNN.mlpackage.zip";
+const CURRENT_MODEL_RELEASE_LABEL: &str = "v0.3.1-murmur-bigru";
+const CURRENT_LOCAL_MURMUR_RUN: &str = "release-circor-5s-spec93-top4-v1";
+const CURRENT_LOCAL_S3_RUN: &str = "s3_circor_v10";
+const DEFAULT_EQ_PRESET: EqPreset = EqPreset::Cardiac;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MurmurAggregation {
+    Mean,
+    TopKMean(usize),
+}
+
+impl MurmurAggregation {
+    fn label(self) -> String {
+        match self {
+            Self::Mean => "mean".to_string(),
+            Self::TopKMean(k) => format!("top{k}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MurmurDecisionConfig {
+    aggregation: MurmurAggregation,
+    threshold: f32,
+}
+
+impl Default for MurmurDecisionConfig {
+    fn default() -> Self {
+        Self {
+            aggregation: MurmurAggregation::Mean,
+            threshold: MURMUR_RECORDING_MEAN_THRESHOLD,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnState {
@@ -86,10 +120,8 @@ struct App {
     gain_db: f32,
     show_spec: bool,
     murmur_prob: Option<f32>,
-    murmur_mean_prob: Option<f32>,
-    murmur_prob_sum: f32,
-    murmur_prob_count: usize,
     murmur_history: Vec<f32>,
+    murmur_config: MurmurDecisionConfig,
     s3_prob: Option<f32>,
     s3_history: Vec<f32>,
     model_path: Option<PathBuf>,
@@ -115,14 +147,12 @@ impl App {
             samples: Vec::with_capacity(WAVEFORM_LEN),
             total_samples: 0,
             spec: Vec::with_capacity(SPECTROGRAM_FRAMES),
-            preset: EqPreset::None,
+            preset: DEFAULT_EQ_PRESET,
             gain_db: 0.0,
             show_spec: true,
             murmur_prob: None,
-            murmur_mean_prob: None,
-            murmur_prob_sum: 0.0,
-            murmur_prob_count: 0,
-            murmur_history: Vec::with_capacity(60),
+            murmur_history: Vec::new(),
+            murmur_config: murmur_decision_config(model_path.as_ref()),
             s3_prob: None,
             s3_history: Vec::with_capacity(60),
             model_path,
@@ -133,10 +163,36 @@ impl App {
 
     fn reset_murmur_aggregation(&mut self) {
         self.murmur_prob = None;
-        self.murmur_mean_prob = None;
-        self.murmur_prob_sum = 0.0;
-        self.murmur_prob_count = 0;
         self.murmur_history.clear();
+    }
+
+    fn murmur_decision_prob(&self) -> Option<f32> {
+        if self.murmur_history.is_empty() {
+            return None;
+        }
+        match self.murmur_config.aggregation {
+            MurmurAggregation::Mean => {
+                let sum: f32 = self.murmur_history.iter().sum();
+                Some(sum / self.murmur_history.len() as f32)
+            }
+            MurmurAggregation::TopKMean(k) => {
+                let mut probs = self.murmur_history.clone();
+                probs.sort_by(|a, b| b.total_cmp(a));
+                let n = probs.len().min(k.max(1));
+                Some(probs[..n].iter().sum::<f32>() / n as f32)
+            }
+        }
+    }
+
+    fn toolbar_status(&self) -> Option<&str> {
+        let status = self.status.as_str();
+        if matches!(status, "idle" | "streaming" | "disconnected")
+            || status.starts_with("model ")
+            || status.starts_with("S3 model loaded")
+        {
+            return None;
+        }
+        Some(status)
     }
 
     fn drain(&mut self) {
@@ -173,13 +229,6 @@ impl App {
                 }
                 Ok(Msg::MurmurProb(p)) => {
                     self.murmur_prob = Some(p);
-                    self.murmur_prob_sum += p;
-                    self.murmur_prob_count += 1;
-                    self.murmur_mean_prob =
-                        Some(self.murmur_prob_sum / self.murmur_prob_count as f32);
-                    if self.murmur_history.len() == 60 {
-                        self.murmur_history.remove(0);
-                    }
                     self.murmur_history.push(p);
                 }
                 Ok(Msg::S3Prob(p)) => {
@@ -193,13 +242,17 @@ impl App {
                     self.model_download_busy = false;
                     match result {
                         Ok(path) => {
-                            self.status = format!("model downloaded: {}", path.display());
+                            self.status = match display_label(&path) {
+                                Some(label) => format!("model downloaded: {label}"),
+                                None => "model downloaded".to_string(),
+                            };
                             if !self.available_models.iter().any(|p| p == &path) {
                                 self.available_models.push(path.clone());
                                 self.available_models.sort();
                                 self.available_models.dedup();
                             }
                             self.model_path = Some(path.clone());
+                            self.murmur_config = murmur_decision_config(self.model_path.as_ref());
                             self.reset_murmur_aggregation();
                             self.s3_prob = None;
                             self.s3_history.clear();
@@ -246,17 +299,21 @@ impl eframe::App for App {
                     };
                     let _ = self.cmd_tx.send(cmd);
                 }
-                ui.separator();
-                ui.label(format!("status: {}", self.status));
+                if let Some(status) = self.toolbar_status() {
+                    ui.separator();
+                    ui.label(status);
+                }
                 if let Some(b) = self.battery {
                     ui.separator();
                     ui.label(format!("battery: {b}%"));
                 }
-                ui.separator();
-                ui.label(format!("rx: {} samples", self.total_samples));
-                if let Some(p) = self.murmur_mean_prob {
+                if matches!(self.state, ConnState::Streaming) {
                     ui.separator();
-                    let color = if p >= MURMUR_RECORDING_MEAN_THRESHOLD {
+                    ui.label(format!("rx: {} samples", self.total_samples));
+                }
+                if let Some(p) = self.murmur_decision_prob() {
+                    ui.separator();
+                    let color = if p >= self.murmur_config.threshold {
                         egui::Color32::from_rgb(220, 60, 60)
                     } else {
                         egui::Color32::from_rgb(80, 180, 80)
@@ -265,7 +322,8 @@ impl eframe::App for App {
                     ui.colored_label(
                         color,
                         format!(
-                            "murmur mean: {:.0}% latest {:.0}%",
+                            "murmur {}: {:.0}% latest {:.0}%",
+                            self.murmur_config.aggregation.label(),
                             p * 100.0,
                             latest * 100.0
                         ),
@@ -310,6 +368,7 @@ impl eframe::App for App {
                     if let Some(p) = chosen {
                         if Some(&p) != self.model_path.as_ref() {
                             self.model_path = Some(p.clone());
+                            self.murmur_config = murmur_decision_config(self.model_path.as_ref());
                             self.reset_murmur_aggregation();
                             self.s3_prob = None;
                             self.s3_history.clear();
@@ -324,6 +383,8 @@ impl eframe::App for App {
                 ui.separator();
                 let dl_label = if self.model_download_busy {
                     "Downloading model..."
+                } else if self.model_path.is_some() {
+                    "Update model"
                 } else {
                     "Download model"
                 };
@@ -539,7 +600,7 @@ struct SessionConfig {
 impl SessionConfig {
     fn new(model_path: Option<PathBuf>) -> Self {
         Self {
-            preset: Arc::new(std::sync::Mutex::new(EqPreset::None)),
+            preset: Arc::new(std::sync::Mutex::new(DEFAULT_EQ_PRESET)),
             gain: Arc::new(std::sync::Mutex::new(1.0)),
             reset_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             model_path: Arc::new(std::sync::Mutex::new(model_path)),
@@ -666,9 +727,13 @@ async fn stream_session(
     // mid-stream (signalled via cfg.model_dirty).
     let load_current_model = |path: Option<&PathBuf>| -> Option<MurmurEngine> {
         match path {
-            Some(p) => match MurmurEngine::load(p, N_FRAMES_MURMUR) {
+            Some(p) => match MurmurEngine::load(p, murmur_frame_count(p)) {
                 Ok(e) => {
-                    let _ = tx.send(Msg::Status(format!("model loaded: {}", p.display())));
+                    let status = match display_label(p) {
+                        Some(label) => format!("model loaded: {label}"),
+                        None => "model loaded".to_string(),
+                    };
+                    let _ = tx.send(Msg::Status(status));
                     Some(e)
                 }
                 Err(err) => {
@@ -680,23 +745,24 @@ async fn stream_session(
         }
     };
 
-    // S3 model is opportunistic — we look in the same directory as the
-    // murmur model for an `S3CNN_v2.mlpackage` sibling and load it if
-    // present. Absent that file the UI runs murmur-only as before.
+    // S3 model is opportunistic — prefer an `S3CNN_v2.mlpackage` sibling
+    // from the release bundle, then fall back to the current local S3 run.
+    // Absent both, the UI runs murmur-only as before.
     let load_s3_model = |murmur_path: Option<&PathBuf>| -> Option<(S3Engine, PathBuf)> {
         let p = murmur_path?;
         let dir = p.parent()?;
-        for candidate_name in ["S3CNN_v2.mlpackage", "S3CNN.mlpackage"] {
-            let candidate = dir.join(candidate_name);
+        let candidates = [
+            dir.join("S3CNN_v2.mlpackage"),
+            dir.join("S3CNN.mlpackage"),
+            fallback_s3_model_path(),
+        ];
+        for candidate in candidates {
             if !candidate.exists() {
                 continue;
             }
             return match S3Engine::load(&candidate, N_FRAMES_S3) {
                 Ok(e) => {
-                    let _ = tx.send(Msg::Status(format!(
-                        "S3 model loaded: {}",
-                        candidate.display()
-                    )));
+                    let _ = tx.send(Msg::Status("S3 model loaded".to_string()));
                     Some((e, candidate))
                 }
                 Err(err) => {
@@ -819,24 +885,24 @@ fn main() -> Result<(), eframe::Error> {
         .init();
 
     // Model path: first CLI arg, preferred env var, or legacy env var.
-    let model_path: Option<PathBuf> = std::env::args()
+    let explicit_model_path: Option<PathBuf> = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("OPENSTETHO_MODEL").map(PathBuf::from))
         .or_else(|| std::env::var_os("EKO_MODEL").map(PathBuf::from))
         .filter(|p| p.exists());
 
-    // Discover candidate mlpackages from preferred or legacy env vars.
-    // Default scan picks up the project's `model/runs/` tree.
-    let model_dirs = std::env::var("OPENSTETHO_MODEL_DIRS")
+    // Explicit model dirs keep the old broad discovery behavior for
+    // experiments. The default UI stays on the current release/local bundle
+    // so legacy runs do not appear in the picker.
+    let env_model_dirs = std::env::var("OPENSTETHO_MODEL_DIRS")
         .or_else(|_| std::env::var("EKO_MODEL_DIRS"))
-        .unwrap_or_else(|_| {
-            format!(
-                "{}/model/runs",
-                env!("CARGO_MANIFEST_DIR").trim_end_matches("/stetho-ui"),
-            )
-        });
-    let available_models = discover_models(&model_dirs, model_path.as_ref());
+        .ok();
+    let available_models = match env_model_dirs {
+        Some(model_dirs) => discover_models(&model_dirs, explicit_model_path.as_ref()),
+        None => discover_current_models(explicit_model_path.as_ref()),
+    };
+    let model_path = explicit_model_path.or_else(|| available_models.first().cloned());
 
     let (msg_tx, msg_rx) = crossbeam_channel::unbounded::<Msg>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Cmd>();
@@ -877,7 +943,7 @@ fn discover_models(dirs: &str, current: Option<&PathBuf>) -> Vec<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if is_model_artifact(&path) {
+                if is_murmur_model_artifact(&path) {
                     found.push(path);
                     continue;
                 }
@@ -891,13 +957,62 @@ fn discover_models(dirs: &str, current: Option<&PathBuf>) -> Vec<PathBuf> {
         }
     }
     if let Some(c) = current {
-        if !found.iter().any(|p| p == c) {
+        if is_murmur_model_artifact(c) && !found.iter().any(|p| p == c) {
             found.insert(0, c.clone());
         }
     }
     found.sort();
     found.dedup();
     found
+}
+
+fn discover_current_models(current: Option<&PathBuf>) -> Vec<PathBuf> {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    discover_current_models_in(&repo_root, default_model_download_dir(), current)
+}
+
+fn discover_current_models_in(
+    repo_root: &std::path::Path,
+    download_dir: PathBuf,
+    current: Option<&PathBuf>,
+) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let downloaded = download_dir.join("MurmurCNN.mlpackage");
+    let local_current = repo_root
+        .join("model/runs")
+        .join(CURRENT_LOCAL_MURMUR_RUN)
+        .join("MurmurCNN.mlpackage");
+
+    // Prefer the downloaded latest-release bundle because it carries the
+    // matching S3 sibling. Fall back to the latest local murmur export.
+    for candidate in [downloaded, local_current] {
+        if candidate.exists() && !found.iter().any(|p| p == &candidate) {
+            found.push(candidate);
+            break;
+        }
+    }
+
+    if let Some(c) = current {
+        if is_murmur_model_artifact(c) && !found.iter().any(|p| p == c) {
+            found.insert(0, c.clone());
+        }
+    }
+    found
+}
+
+fn is_murmur_model_artifact(path: &std::path::Path) -> bool {
+    is_model_artifact(path)
+        && path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| {
+                name.eq_ignore_ascii_case("MurmurCNN.mlpackage")
+                    || name.eq_ignore_ascii_case("MurmurCNN.mlmodel")
+            })
+            .unwrap_or(false)
 }
 
 fn is_model_artifact(path: &std::path::Path) -> bool {
@@ -908,12 +1023,88 @@ fn is_model_artifact(path: &std::path::Path) -> bool {
 }
 
 fn display_label(path: &std::path::Path) -> Option<String> {
-    // .mlpackage bundles sit inside a `runs/<name>/MurmurCNN.mlpackage`
-    // layout — use the run name as the label.
-    path.parent()
+    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("model");
+    let parent = path
+        .parent()
         .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
+        .and_then(|s| s.to_str())?;
+    if parent == "downloaded" && filename == "MurmurCNN.mlpackage" {
+        return Some(format!("{CURRENT_MODEL_RELEASE_LABEL} (Murmur + S3)"));
+    }
+    if parent == CURRENT_LOCAL_MURMUR_RUN && filename == "MurmurCNN.mlpackage" {
+        return Some("CirCor 2022 murmur 5s top4".to_string());
+    }
+    Some(format!("{parent}/{filename}"))
+}
+
+fn fallback_s3_model_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("model/runs")
+        .join(CURRENT_LOCAL_S3_RUN)
+        .join("S3CNN_v2.mlpackage")
+}
+
+fn murmur_frame_count(path: &std::path::Path) -> usize {
+    model_metadata(path)
+        .and_then(|v| v.get("n_frames").and_then(|n| n.as_u64()))
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(N_FRAMES_MURMUR)
+}
+
+fn murmur_decision_config(path: Option<&PathBuf>) -> MurmurDecisionConfig {
+    let Some(path) = path else {
+        return MurmurDecisionConfig::default();
+    };
+    let Some(metadata) = model_metadata(path) else {
+        return MurmurDecisionConfig::default();
+    };
+    let aggregation = metadata
+        .get("murmur_aggregation")
+        .and_then(|v| v.as_str())
+        .and_then(|value| {
+            let topk = metadata
+                .get("murmur_topk")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| usize::try_from(n).ok());
+            parse_murmur_aggregation(value, topk)
+        })
+        .unwrap_or(MurmurAggregation::Mean);
+    let threshold = metadata
+        .get("murmur_threshold")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or_else(|| MurmurDecisionConfig::default().threshold);
+
+    MurmurDecisionConfig {
+        aggregation,
+        threshold,
+    }
+}
+
+fn parse_murmur_aggregation(value: &str, topk: Option<usize>) -> Option<MurmurAggregation> {
+    match value {
+        "mean" => Some(MurmurAggregation::Mean),
+        "topk_mean" => Some(MurmurAggregation::TopKMean(topk.unwrap_or(3).max(1))),
+        "top3_mean" => Some(MurmurAggregation::TopKMean(3)),
+        "top4_mean" => Some(MurmurAggregation::TopKMean(4)),
+        "top5_mean" => Some(MurmurAggregation::TopKMean(5)),
+        _ => None,
+    }
+}
+
+fn model_metadata(model_path: &std::path::Path) -> Option<serde_json::Value> {
+    model_metadata_path(model_path)
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+fn model_metadata_path(model_path: &std::path::Path) -> Option<PathBuf> {
+    let stem = model_path.file_stem()?.to_str()?;
+    Some(model_path.with_file_name(format!("{stem}.openstetho.json")))
 }
 
 fn default_model_download_dir() -> PathBuf {
@@ -999,39 +1190,102 @@ fn extract_model_zip(
         }
     }
 
-    let model = find_downloaded_model(&extract_dir)
+    let models = find_downloaded_models(&extract_dir);
+    if models.is_empty() {
+        return Err(anyhow::anyhow!(
+            "download did not contain a .mlpackage or .mlmodel"
+        ));
+    }
+    let mut installed = Vec::with_capacity(models.len());
+    for model in models {
+        let dest = out_dir.join(
+            model
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("downloaded model has no file name"))?,
+        );
+        if dest.exists() {
+            if dest.is_dir() {
+                fs::remove_dir_all(&dest)?;
+            } else {
+                fs::remove_file(&dest)?;
+            }
+        }
+        fs::rename(&model, &dest)?;
+        installed.push(dest);
+    }
+    let model = prefer_murmur_model(&installed)
         .ok_or_else(|| anyhow::anyhow!("download did not contain a .mlpackage or .mlmodel"))?;
-    let dest = out_dir.join(
-        model
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("downloaded model has no file name"))?,
-    );
-    if dest.exists() {
-        if dest.is_dir() {
-            fs::remove_dir_all(&dest)?;
-        } else {
-            fs::remove_file(&dest)?;
+    for metadata in find_model_metadata_files(&extract_dir) {
+        if let Some(name) = metadata.file_name() {
+            fs::rename(&metadata, out_dir.join(name))?;
         }
     }
-    fs::rename(&model, &dest)?;
     let _ = fs::remove_dir_all(&extract_dir);
-    Ok(dest)
+    Ok(model)
 }
 
-fn find_downloaded_model(root: &std::path::Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
+fn prefer_murmur_model(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map(|name| name.eq_ignore_ascii_case("MurmurCNN.mlpackage"))
+                .unwrap_or(false)
+        })
+        .or_else(|| paths.first())
+        .cloned()
+}
+
+fn find_downloaded_models(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_downloaded_models(root, &mut found);
+    found.sort();
+    found
+}
+
+fn find_model_metadata_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    collect_model_metadata_files(root, &mut found);
+    found.sort();
+    found
+}
+
+fn collect_model_metadata_files(root: &std::path::Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.ends_with(".openstetho.json"))
+            .unwrap_or(false)
+        {
+            found.push(path);
+            continue;
+        }
+        if path.is_dir() {
+            collect_model_metadata_files(&path, found);
+        }
+    }
+}
+
+fn collect_downloaded_models(root: &std::path::Path, found: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if is_model_artifact(&path) {
-            return Some(path);
+            found.push(path);
+            continue;
         }
         if path.is_dir() {
-            if let Some(found) = find_downloaded_model(&path) {
-                return Some(found);
-            }
+            collect_downloaded_models(&path, found);
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -1052,10 +1306,19 @@ mod tests {
         let cursor = io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(cursor);
         let opts = zip::write::SimpleFileOptions::default();
+        zip.add_directory("S3CNN_v2.mlpackage/", opts).unwrap();
+        zip.start_file("S3CNN_v2.mlpackage/Manifest.json", opts)
+            .unwrap();
+        zip.write_all(br#"{"model":"synthetic-s3"}"#).unwrap();
         zip.add_directory("MurmurCNN.mlpackage/", opts).unwrap();
         zip.start_file("MurmurCNN.mlpackage/Manifest.json", opts)
             .unwrap();
-        zip.write_all(br#"{"model":"synthetic"}"#).unwrap();
+        zip.write_all(br#"{"model":"synthetic-murmur"}"#).unwrap();
+        zip.start_file("MurmurCNN.openstetho.json", opts).unwrap();
+        zip.write_all(
+            br#"{"n_frames":78,"murmur_aggregation":"topk_mean","murmur_topk":4,"murmur_threshold":0.34336904}"#,
+        )
+        .unwrap();
         zip.finish().unwrap().into_inner()
     }
 
@@ -1089,11 +1352,94 @@ mod tests {
             Some("MurmurCNN.mlpackage")
         );
         assert!(model.join("Manifest.json").exists());
+        assert!(out_dir.join("S3CNN_v2.mlpackage/Manifest.json").exists());
+        assert!(out_dir.join("MurmurCNN.openstetho.json").exists());
+        assert_eq!(murmur_frame_count(&model), 78);
+        let config = murmur_decision_config(Some(&model));
+        assert_eq!(config.aggregation, MurmurAggregation::TopKMean(4));
+        assert!((config.threshold - 0.34336904).abs() < f32::EPSILON);
 
         let discovered = discover_models(out_dir.to_str().unwrap(), None);
         assert_eq!(discovered, vec![model]);
 
         let _ = fs::remove_dir_all(out_dir);
+    }
+
+    #[test]
+    fn downloaded_bundle_label_is_explicit() {
+        let path = std::path::Path::new("model/runs/downloaded/MurmurCNN.mlpackage");
+
+        assert_eq!(
+            display_label(path).as_deref(),
+            Some("v0.3.1-murmur-bigru (Murmur + S3)")
+        );
+    }
+
+    #[test]
+    fn missing_metadata_uses_legacy_murmur_frame_count() {
+        let path = std::path::Path::new("model/runs/release-circor-v2/MurmurCNN.mlpackage");
+
+        assert_eq!(murmur_frame_count(path), N_FRAMES_MURMUR);
+    }
+
+    #[test]
+    fn missing_metadata_uses_legacy_murmur_decision_config() {
+        let path = PathBuf::from("model/runs/release-circor-v2/MurmurCNN.mlpackage");
+        let config = murmur_decision_config(Some(&path));
+
+        assert_eq!(config.aggregation, MurmurAggregation::Mean);
+        assert_eq!(config.threshold, MURMUR_RECORDING_MEAN_THRESHOLD);
+    }
+
+    #[test]
+    fn default_discovery_uses_latest_downloaded_bundle_only() {
+        let repo = temp_dir("model-discovery-repo");
+        let download_dir = temp_dir("model-discovery-download");
+        let downloaded = download_dir.join("MurmurCNN.mlpackage");
+        let current = repo
+            .join("model/runs")
+            .join(CURRENT_LOCAL_MURMUR_RUN)
+            .join("MurmurCNN.mlpackage");
+        let old = repo
+            .join("model/runs/release-circor-v1")
+            .join("MurmurCNN.mlpackage");
+
+        fs::create_dir_all(&downloaded).unwrap();
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&old).unwrap();
+
+        let discovered = discover_current_models_in(&repo, download_dir.clone(), None);
+
+        assert_eq!(discovered, vec![downloaded]);
+        assert!(!discovered.iter().any(|p| p == &current));
+        assert!(!discovered.iter().any(|p| p == &old));
+
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(download_dir);
+    }
+
+    #[test]
+    fn default_discovery_falls_back_to_current_local_run() {
+        let repo = temp_dir("model-discovery-local");
+        let download_dir = temp_dir("model-discovery-empty-download");
+        let current = repo
+            .join("model/runs")
+            .join(CURRENT_LOCAL_MURMUR_RUN)
+            .join("MurmurCNN.mlpackage");
+        let old = repo
+            .join("model/runs/release-circor-v1")
+            .join("MurmurCNN.mlpackage");
+
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&old).unwrap();
+
+        let discovered = discover_current_models_in(&repo, download_dir.clone(), None);
+
+        assert_eq!(discovered, vec![current]);
+        assert!(!discovered.iter().any(|p| p == &old));
+
+        let _ = fs::remove_dir_all(repo);
+        let _ = fs::remove_dir_all(download_dir);
     }
 
     #[test]

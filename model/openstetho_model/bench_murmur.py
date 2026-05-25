@@ -122,12 +122,59 @@ def best_by(rows: list[dict[str, float]], key: str) -> dict[str, float]:
     return max(rows, key=lambda r: (r[key], r["specificity"], r["threshold"]))
 
 
+THRESHOLD_METRICS = {"best_f1": "f1", "best_youden_j": "youden_j"}
+SPECIFICITY_POLICY_TARGETS = {
+    "specificity_ge_0_90": 0.90,
+    "specificity_ge_0_93": 0.93,
+    "specificity_ge_0_94": 0.94,
+    "specificity_ge_0_95": 0.95,
+}
+THRESHOLD_POLICY_NAMES = (
+    "best_f1",
+    "best_youden_j",
+    "sensitivity_ge_0_80",
+    *SPECIFICITY_POLICY_TARGETS.keys(),
+)
+
+
+def threshold_policy_row(rows: list[dict[str, float]], policy: str) -> dict[str, float]:
+    if policy in THRESHOLD_METRICS:
+        out = dict(best_by(rows, THRESHOLD_METRICS[policy]))
+        out["constraint_met"] = 1.0
+        return out
+    if policy == "sensitivity_ge_0_80":
+        candidates = [row for row in rows if row["sensitivity"] >= 0.80]
+        if candidates:
+            out = dict(max(candidates, key=lambda r: (r["specificity"], r["f1"], r["threshold"])))
+            out["constraint_met"] = 1.0
+            return out
+        out = dict(max(rows, key=lambda r: (r["sensitivity"], r["specificity"], r["f1"])))
+        out["constraint_met"] = 0.0
+        return out
+    if policy in SPECIFICITY_POLICY_TARGETS:
+        return specificity_constrained_row(rows, SPECIFICITY_POLICY_TARGETS[policy])
+    raise ValueError(f"unknown threshold policy {policy!r}; valid: {THRESHOLD_POLICY_NAMES}")
+
+
+def specificity_constrained_row(
+    rows: list[dict[str, float]],
+    min_specificity: float,
+) -> dict[str, float]:
+    candidates = [row for row in rows if row["specificity"] >= min_specificity]
+    if candidates:
+        out = dict(max(candidates, key=lambda r: (r["sensitivity"], r["f1"], r["threshold"])))
+        out["constraint_met"] = 1.0
+        return out
+    out = dict(max(rows, key=lambda r: (r["specificity"], r["sensitivity"], r["f1"])))
+    out["constraint_met"] = 0.0
+    return out
+
+
 def sweep_summary(labels: np.ndarray, scores: np.ndarray) -> dict[str, object]:
     rows = sweep_thresholds(labels, scores)
     return {
         "threshold_0_5": binary_metrics(labels, scores, 0.5),
-        "best_f1": best_by(rows, "f1"),
-        "best_youden_j": best_by(rows, "youden_j"),
+        **{policy: threshold_policy_row(rows, policy) for policy in THRESHOLD_POLICY_NAMES},
     }
 
 
@@ -137,8 +184,10 @@ def aggregate_values(values: list[float], mode: str) -> float:
         return float(arr.mean())
     if mode == "median":
         return float(np.median(arr))
-    if mode == "top3_mean":
-        return float(np.sort(arr)[-3:].mean())
+    if mode.startswith("top") and mode.endswith("_mean"):
+        k_text = mode.removeprefix("top").removesuffix("_mean")
+        k = 3 if k_text == "k" else int(k_text)
+        return float(np.sort(arr)[-k:].mean())
     return float(arr.max())
 
 
@@ -636,11 +685,7 @@ def run(args: argparse.Namespace) -> dict:
         rec_modes: dict[str, object] = {}
         for mode in args.recording_aggregates:
             rec_labels, rec_scores = recording_level(example_meta, labels_arr, arr, mode)
-            rec_modes[mode] = {
-                "threshold_0_5": binary_metrics(rec_labels, rec_scores, args.threshold),
-                "best_f1": best_by(sweep_thresholds(rec_labels, rec_scores), "f1"),
-                "best_youden_j": best_by(sweep_thresholds(rec_labels, rec_scores), "youden_j"),
-            }
+            rec_modes[mode] = sweep_summary(rec_labels, rec_scores)
         report["recording_level"][name] = rec_modes  # type: ignore[index]
         vote_rows = vote_sweep(example_meta, labels_arr, arr, vote_thresholds, vote_counts)
         report["recording_vote"][name] = vote_summary(vote_rows)  # type: ignore[index]
@@ -785,7 +830,7 @@ def main() -> None:
     p.add_argument(
         "--recording-aggregates",
         nargs="+",
-        choices=["max", "mean", "median", "top3_mean"],
+        choices=["max", "mean", "median", "topk_mean", "top2_mean", "top3_mean", "top4_mean", "top5_mean"],
         default=["max", "mean", "top3_mean"],
     )
     p.add_argument("--max-windows", type=int, default=None)

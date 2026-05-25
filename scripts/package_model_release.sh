@@ -57,17 +57,24 @@ mkdir -p "$DIST"
 rm -f "$OUT"
 
 cp -R "$MURMUR_SRC" "$STAGING/MurmurCNN.mlpackage"
+MURMUR_META="$(dirname "$MURMUR_SRC")/MurmurCNN.openstetho.json"
+if [ -f "$MURMUR_META" ]; then
+    cp "$MURMUR_META" "$STAGING/MurmurCNN.openstetho.json"
+fi
 if [ -n "$S3_SRC" ]; then
     cp -R "$S3_SRC" "$STAGING/$S3_NAME"
 fi
 
 (
     cd "$STAGING"
-    if [ -n "$S3_SRC" ]; then
-        zip -qry "$OUT" "MurmurCNN.mlpackage" "$S3_NAME"
-    else
-        zip -qry "$OUT" "MurmurCNN.mlpackage"
+    ZIP_ITEMS=("MurmurCNN.mlpackage")
+    if [ -f "MurmurCNN.openstetho.json" ]; then
+        ZIP_ITEMS+=("MurmurCNN.openstetho.json")
     fi
+    if [ -n "$S3_SRC" ]; then
+        ZIP_ITEMS+=("$S3_NAME")
+    fi
+    zip -qry "$OUT" "${ZIP_ITEMS[@]}"
 )
 
 du -h "$OUT"

@@ -37,10 +37,17 @@ from .model import (
     count_parameters,
 )
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
+from .thresholds import (
+    SPECIFICITY_POLICY_TARGETS,
+    specificity_constrained_row,
+    sweep_thresholds,
+    threshold_policy_row,
+)
 
 log = logging.getLogger("train")
 LOSS_TYPES = ("bce", "focal_bce", "asymmetric_focal")
 LOSS_LOGIT_CLIP = 30.0
+SELECT_METRICS = ("auc", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target")
 
 
 def build_model(architecture: str, in_channels: int = 1, wide_feature_dim: int = 0) -> nn.Module:
@@ -511,6 +518,75 @@ def run_recording_epoch(
     return float(np.mean(losses)), auc
 
 
+def predict_windows(
+    model: nn.Module,
+    loader: Iterable,
+    dev: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    probs: list[float] = []
+    labels: list[int] = []
+    with torch.no_grad():
+        for mel, label in loader:
+            mel = mel.to(dev, non_blocking=True)
+            logit = model(mel)
+            probs.extend(torch.sigmoid(logit).detach().cpu().numpy().tolist())
+            labels.extend(int(round(x)) for x in label.numpy().tolist())
+    return np.asarray(labels, dtype=np.int64), np.asarray(probs, dtype=np.float64)
+
+
+def predict_recordings(
+    model: nn.Module,
+    loader: Iterable,
+    dev: torch.device,
+    aggregation: str,
+    topk: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    probs: list[float] = []
+    labels_out: list[int] = []
+    with torch.no_grad():
+        for batch in loader:
+            recordings, labels, wides, _teachers = unpack_recording_batch(batch, dev)
+            logits = recording_batch_logits(
+                model,
+                recordings,
+                dev,
+                aggregation,
+                topk,
+                wides=wides,
+            )
+            probs.extend(torch.sigmoid(logits).detach().cpu().numpy().tolist())
+            labels_out.extend(int(round(x)) for x in labels.detach().cpu().numpy().tolist())
+    return np.asarray(labels_out, dtype=np.int64), np.asarray(probs, dtype=np.float64)
+
+
+def validation_selection(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    metric: str,
+    specificity_target: float = 0.95,
+) -> tuple[float, dict[str, float]]:
+    rows = sweep_thresholds(labels, probs)
+    if metric == "f1":
+        row = threshold_policy_row(rows, "best_f1")
+        return float(row["f1"]), row
+    if metric == "youden_j":
+        row = threshold_policy_row(rows, "best_youden_j")
+        return float(row["youden_j"]), row
+    if metric in SPECIFICITY_POLICY_TARGETS:
+        row = threshold_policy_row(rows, metric)
+        if row.get("constraint_met", 0.0) >= 1.0:
+            return float(row["sensitivity"]), row
+        return float(row["specificity"]) - 1.0, row
+    if metric == "specificity_target":
+        row = specificity_constrained_row(rows, specificity_target)
+        if row.get("constraint_met", 0.0) >= 1.0:
+            return float(row["sensitivity"]), row
+        return float(row["specificity"]) - 1.0, row
+    raise ValueError(f"unknown select metric {metric!r}; valid: {SELECT_METRICS}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=Path, required=True, help="CirCor root (training_data.csv lives here)")
@@ -556,6 +632,21 @@ def main():
     p.add_argument("--topk", type=int, default=3, help="k for --aggregation topk_mean")
     p.add_argument("--loss", choices=LOSS_TYPES, default="bce")
     p.add_argument(
+        "--select-metric",
+        choices=SELECT_METRICS,
+        default="auc",
+        help=(
+            "checkpoint selection metric; specificity_* maximizes validation "
+            "sensitivity among thresholds with the requested minimum specificity"
+        ),
+    )
+    p.add_argument(
+        "--select-specificity-target",
+        type=float,
+        default=0.95,
+        help="minimum specificity for --select-metric specificity_target",
+    )
+    p.add_argument(
         "--pos-weight-multiplier",
         type=float,
         default=1.0,
@@ -574,7 +665,7 @@ def main():
         "--lr-scheduler",
         choices=["none", "plateau"],
         default="none",
-        help="optional validation-AUC ReduceLROnPlateau scheduler",
+        help="optional validation-selection ReduceLROnPlateau scheduler",
     )
     p.add_argument("--plateau-patience", type=int, default=2)
     p.add_argument("--plateau-factor", type=float, default=0.5)
@@ -582,7 +673,7 @@ def main():
         "--early-stopping-patience",
         type=int,
         default=0,
-        help="stop after N epochs without validation-AUC improvement; 0 disables",
+        help="stop after N epochs without validation selection-metric improvement; 0 disables",
     )
     p.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     p.add_argument(
@@ -731,6 +822,8 @@ def main():
         )
 
     best_auc = float("-inf")
+    best_select = float("-inf")
+    best_select_row: dict[str, float] = {}
     saved_best = False
     epochs_since_improvement = 0
     history = []
@@ -753,6 +846,25 @@ def main():
         else:
             tr_loss, tr_auc = run_epoch(model, train_loader, loss_fn, opt, dev, args.grad_clip_norm)
             va_loss, va_auc = run_epoch(model, val_loader, loss_fn, None, dev)
+        va_select = va_auc
+        va_select_row: dict[str, float] = {}
+        if args.select_metric != "auc":
+            if args.level == "recording":
+                va_labels, va_probs = predict_recordings(
+                    model,
+                    val_loader,
+                    dev,
+                    args.aggregation,
+                    args.topk,
+                )
+            else:
+                va_labels, va_probs = predict_windows(model, val_loader, dev)
+            va_select, va_select_row = validation_selection(
+                va_labels,
+                va_probs,
+                args.select_metric,
+                args.select_specificity_target,
+            )
         lr_now = float(opt.param_groups[0]["lr"])
         history.append({
             "epoch": epoch,
@@ -760,14 +872,34 @@ def main():
             "tr_auc": tr_auc,
             "va_loss": va_loss,
             "va_auc": va_auc,
+            "va_select": va_select,
+            "va_select_threshold": va_select_row.get("threshold"),
+            "va_select_sensitivity": va_select_row.get("sensitivity"),
+            "va_select_specificity": va_select_row.get("specificity"),
+            "va_select_f1": va_select_row.get("f1"),
+            "va_select_constraint_met": va_select_row.get("constraint_met"),
             "lr": lr_now,
         })
-        log.info("ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f", epoch, tr_loss, tr_auc, va_loss, va_auc)
+        log.info(
+            "ep %02d | tr loss %.4f auc %.3f | va loss %.4f auc %.3f select %.3f",
+            epoch,
+            tr_loss,
+            tr_auc,
+            va_loss,
+            va_auc,
+            va_select,
+        )
         torch.save(model.state_dict(), args.out / "last.pt")
-        improved = bool(np.isfinite(va_auc) and va_auc > best_auc + args.early_stopping_min_delta)
+        improved = bool(
+            np.isfinite(va_select)
+            and va_select > best_select + args.early_stopping_min_delta
+        )
         if improved or not saved_best:
             if np.isfinite(va_auc):
                 best_auc = va_auc
+            if np.isfinite(va_select):
+                best_select = va_select
+                best_select_row = dict(va_select_row)
             if improved:
                 epochs_since_improvement = 0
             saved_best = True
@@ -775,6 +907,10 @@ def main():
             (args.out / "best_meta.json").write_text(json.dumps({
                 "epoch": epoch,
                 "val_auc": va_auc,
+                "select_metric": args.select_metric,
+                "select_specificity_target": args.select_specificity_target,
+                "select_score": va_select,
+                "select_threshold": va_select_row,
                 "level": args.level,
                 "architecture": args.architecture,
                 "feature_mode": args.feature_mode,
@@ -814,21 +950,30 @@ def main():
             epochs_since_improvement += 1
 
         if scheduler is not None:
-            scheduler.step(va_auc if np.isfinite(va_auc) else -va_loss)
+            scheduler.step(va_select if np.isfinite(va_select) else -va_loss)
 
         if (
             args.early_stopping_patience > 0
             and epochs_since_improvement >= args.early_stopping_patience
         ):
             log.info(
-                "early stopping after %d epochs without validation-AUC improvement",
+                "early stopping after %d epochs without validation-%s improvement",
                 epochs_since_improvement,
+                args.select_metric,
             )
             break
 
     (args.out / "history.json").write_text(json.dumps(history, indent=2))
     best_auc_msg = f"{best_auc:.3f}" if np.isfinite(best_auc) else "nan"
-    log.info("best val AUC: %s → %s/best.pt", best_auc_msg, args.out)
+    best_select_msg = f"{best_select:.3f}" if np.isfinite(best_select) else "nan"
+    log.info(
+        "best val AUC: %s | best %s: %s %s → %s/best.pt",
+        best_auc_msg,
+        args.select_metric,
+        best_select_msg,
+        best_select_row,
+        args.out,
+    )
 
 
 if __name__ == "__main__":

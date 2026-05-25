@@ -15,10 +15,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Subset
 
-from .bench_murmur import best_by, binary_metrics, json_safe, sweep_thresholds
+from .bench_murmur import (
+    THRESHOLD_POLICY_NAMES,
+    binary_metrics,
+    json_safe,
+    sweep_thresholds,
+    threshold_policy_row,
+)
 from .dataset import CirCorRecordingMurmurDataset, load_recording_teacher_targets, window_hop_samples
 from .model import count_parameters
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
+from .thresholds import SPECIFICITY_POLICY_TARGETS, specificity_constrained_row
 from .train import (
     LOSS_TYPES,
     _patient_labels,
@@ -39,8 +46,7 @@ from .train import (
 log = logging.getLogger("cv_murmur")
 PROB_EPS = 1e-6
 CALIBRATION_METHODS = ("none", "platt", "isotonic")
-THRESHOLD_KEYS = ("best_f1", "best_youden_j", "sensitivity_ge_0_80", "specificity_ge_0_90")
-THRESHOLD_METRICS = {"best_f1": "f1", "best_youden_j": "youden_j"}
+THRESHOLD_KEYS = THRESHOLD_POLICY_NAMES
 
 
 def stratified_patient_folds(
@@ -185,6 +191,21 @@ def train_fold(
                 va_select = float(va_metrics["best_f1"]["f1"])  # type: ignore[index]
             elif args.select_metric == "youden_j":
                 va_select = float(va_metrics["best_youden_j"]["youden_j"])  # type: ignore[index]
+            elif args.select_metric in SPECIFICITY_POLICY_TARGETS:
+                row = va_metrics[args.select_metric]  # type: ignore[index]
+                if row["constraint_met"] >= 1.0:
+                    va_select = float(row["sensitivity"])
+                else:
+                    va_select = float(row["specificity"]) - 1.0
+            elif args.select_metric == "specificity_target":
+                row = specificity_constrained_row(
+                    sweep_thresholds(va_labels, va_probs),
+                    args.select_specificity_target,
+                )
+                if row["constraint_met"] >= 1.0:
+                    va_select = float(row["sensitivity"])
+                else:
+                    va_select = float(row["specificity"]) - 1.0
             else:
                 raise ValueError(f"unknown select metric {args.select_metric!r}")
         lr_now = float(opt.param_groups[0]["lr"])
@@ -424,40 +445,11 @@ def calibration_curve_points(
     ]
 
 
-def threshold_policy_row(rows: list[dict[str, float]], policy: str) -> dict[str, float]:
-    if policy in THRESHOLD_METRICS:
-        out = dict(best_by(rows, THRESHOLD_METRICS[policy]))
-        out["constraint_met"] = 1.0
-        return out
-    if policy == "sensitivity_ge_0_80":
-        candidates = [row for row in rows if row["sensitivity"] >= 0.80]
-        if candidates:
-            out = dict(max(candidates, key=lambda r: (r["specificity"], r["f1"], r["threshold"])))
-            out["constraint_met"] = 1.0
-            return out
-        out = dict(max(rows, key=lambda r: (r["sensitivity"], r["specificity"], r["f1"])))
-        out["constraint_met"] = 0.0
-        return out
-    if policy == "specificity_ge_0_90":
-        candidates = [row for row in rows if row["specificity"] >= 0.90]
-        if candidates:
-            out = dict(max(candidates, key=lambda r: (r["sensitivity"], r["f1"], r["threshold"])))
-            out["constraint_met"] = 1.0
-            return out
-        out = dict(max(rows, key=lambda r: (r["specificity"], r["sensitivity"], r["f1"])))
-        out["constraint_met"] = 0.0
-        return out
-    raise ValueError(f"unknown threshold policy {policy!r}; valid: {THRESHOLD_KEYS}")
-
-
 def summarize(labels: np.ndarray, probs: np.ndarray, threshold: float) -> dict[str, object]:
     rows = sweep_thresholds(labels, probs)
     return {
         "threshold": binary_metrics(labels, probs, threshold),
-        "best_f1": best_by(rows, "f1"),
-        "best_youden_j": best_by(rows, "youden_j"),
-        "sensitivity_ge_0_80": threshold_policy_row(rows, "sensitivity_ge_0_80"),
-        "specificity_ge_0_90": threshold_policy_row(rows, "specificity_ge_0_90"),
+        **{policy: threshold_policy_row(rows, policy) for policy in THRESHOLD_KEYS},
         **probability_metrics(labels, probs),
         "calibration_curve_10": calibration_curve_points(labels, probs, n_bins=10),
     }
@@ -711,7 +703,12 @@ def main() -> None:
     p.add_argument("--aggregation", choices=["mean", "topk_mean", "max"], default="mean")
     p.add_argument("--topk", type=int, default=3)
     p.add_argument("--threshold", type=float, default=0.5)
-    p.add_argument("--select-metric", choices=["auc", "f1", "youden_j"], default="auc")
+    p.add_argument(
+        "--select-metric",
+        choices=["auc", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target"],
+        default="auc",
+    )
+    p.add_argument("--select-specificity-target", type=float, default=0.95)
     p.add_argument("--loss", choices=LOSS_TYPES, default="bce")
     p.add_argument("--pos-weight-multiplier", type=float, default=1.0)
     p.add_argument("--focal-gamma", type=float, default=2.0)

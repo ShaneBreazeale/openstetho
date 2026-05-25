@@ -34,11 +34,11 @@ packages are produced by the training pipeline:
   for the cardiologist-labeled validation summary.
 
 Latest model bundle:
-[`v0.3.0-murmur-bigru`](https://github.com/ShaneBreazeale/openstetho/releases/tag/v0.3.0-murmur-bigru)
-publishes `MurmurCNN.mlpackage.zip`, containing the CNN+BiGRU murmur model
-and the `S3CNN_v2` sibling. On the full CirCor benchmark, the CNN+BiGRU
-recording-mean murmur model reached AUROC 0.868 and best-F1 0.702
-(sensitivity 0.634, specificity 0.956). See
+[`v0.3.1-murmur-bigru`](https://github.com/ShaneBreazeale/openstetho/releases/tag/v0.3.1-murmur-bigru)
+publishes `MurmurCNN.mlpackage.zip`, containing the 5s CNN+BiGRU murmur
+model, app-side decision metadata, and the `S3CNN_v2` sibling. On the full
+CirCor Core ML benchmark, the baked top4-mean sidecar rule reached AUROC
+0.909 and F1 0.749 (sensitivity 0.749, specificity 0.936). See
 [`docs/murmur_detector_benchmark.md`](docs/murmur_detector_benchmark.md)
 for commands, thresholds, and caveats.
 
@@ -60,7 +60,7 @@ scripts/package_model_release.sh model/runs/v1/MurmurCNN.mlpackage
 
 # murmur + S3 (recommended for current releases)
 scripts/package_model_release.sh \
-    model/runs/release-circor-v2/MurmurCNN.mlpackage \
+    model/runs/release-circor-5s-spec93-top4-v1/MurmurCNN.mlpackage \
     model/runs/s3_circor_v10/S3CNN_v2.mlpackage
 ```
 
