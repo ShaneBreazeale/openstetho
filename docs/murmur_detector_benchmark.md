@@ -937,6 +937,44 @@ single Core ML artifact needs either multi-model export or distilling the
 ensemble into one student — that is the next deployment step. The released
 app-facing checkpoint is governed separately and is unchanged.
 
+## Distillation to a Single Deployable Model (negative, gate-rejected)
+
+The v2 ensemble is a research/benchmark lead but not a single Core ML artifact.
+The clean route to a deployable single model is distillation: train one student
+to mimic the ensemble's out-of-fold soft targets (teacher = our own ensemble on
+public CirCor, not a vendor model). `ensemble_oof.py` now also emits
+`patient_id`/`location`, so its OoF CSV is a drop-in teacher for
+`cv_murmur --teacher-predictions-csv ... --teacher-prob-column prob`. The OoF
+targets are leak-free (each came from models that did not train on that
+recording), and coverage is full (2964/2964).
+
+A distill-weight sweep was gated against the **prior single-model** baseline
+(`logmel_5s_bce_f1`, transferred F1 `0.5972`):
+
+| distill weight | verdict | transferred F1 | OoF AUROC | Platt AUROC | spec>=0.90 sens | Platt ECE |
+|---:|---|---:|---:|---:|---:|---:|
+| 0.1 | REGRESSED | 0.3795 | 0.7723 | 0.7498 | 0.4950 | 0.0715 |
+| 0.2 | REGRESSED | 0.5564 | 0.8245 | 0.8123 | 0.5809 | 0.0234 |
+| 0.5 | REGRESSED | 0.5532 | 0.8064 | 0.7840 | 0.5627 | 0.0252 |
+| 1.0 | REGRESSED | 0.5618 | 0.7933 | 0.7715 | 0.5561 | 0.0529 |
+
+All four regressed on the gated primary. High weights (0.5/1.0) inflate the loss
+scale and destabilize pooled ranking (the recurring fold-vs-pooled optimism:
+fold val AUROC reached ~0.85 while pooled OoF fell). The best point, `w=0.2`, is
+a **lateral move, not a win**: OoF AUROC nudges up (`0.8245` vs `0.8172`) and
+calibration improves markedly (ECE `0.0234` vs `0.0396`), but the calibrated
+transferred best-F1 drops to `0.5564` because that operating point shifts toward
+sensitivity (transferred specificity `0.94 -> 0.885`). It does help the
+high-recall screening point (`sens>=0.80` specificity `0.642 -> 0.665`).
+
+Conclusion: a single distilled student does not beat the prior single model on
+the gated primary metric at any tested weight. The clean shipped win remains the
+3-seed ensemble. To deploy it, prefer multi-model Core ML export (run the three
+checkpoints, average logits) over distillation. If distillation is revisited,
+try specificity-oriented checkpoint selection (the gap is operating-point, not
+ranking), distillation temperature, or distilling from per-window rather than
+recording-level teacher targets.
+
 ## Current Recommendation
 
 - The clean, gate-promoted lead is now the **3-seed bagged ensemble** of the 5s

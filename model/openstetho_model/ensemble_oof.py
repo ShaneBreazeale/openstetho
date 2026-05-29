@@ -39,12 +39,18 @@ from .bench_murmur import json_safe
 
 
 def _load_oof(run_dir: Path) -> dict[str, dict]:
-    """Map recording -> {fold, label, prob} from a run's oof_predictions.csv."""
+    """Map recording -> row from a run's oof_predictions.csv.
+
+    Carries patient_id/location so the ensemble OoF can double as a
+    distillation teacher CSV (the teacher loader groups by patient_id,location).
+    """
     rows: dict[str, dict] = {}
     with (run_dir / "oof_predictions.csv").open(newline="") as f:
         for row in csv.DictReader(f):
             rows[row["recording"]] = {
                 "fold": int(row["fold"]),
+                "patient_id": row.get("patient_id", ""),
+                "location": row.get("location", ""),
                 "label": int(row["label"]),
                 "prob": float(row["prob"]),
             }
@@ -69,7 +75,14 @@ def ensemble(run_dirs: list[Path], threshold: float = 0.5) -> tuple[dict, list[d
         if any(m[rec]["label"] != label for m in members):
             raise ValueError(f"label mismatch for recording {rec} across runs")
         prob = float(np.mean([m[rec]["prob"] for m in members]))
-        pred_rows.append({"fold": reference[rec]["fold"], "recording": rec, "label": label, "prob": prob})
+        pred_rows.append({
+            "fold": reference[rec]["fold"],
+            "patient_id": reference[rec]["patient_id"],
+            "location": reference[rec]["location"],
+            "recording": rec,
+            "label": label,
+            "prob": prob,
+        })
 
     folds = np.asarray([r["fold"] for r in pred_rows], dtype=np.int64)
     labels = np.asarray([r["label"] for r in pred_rows], dtype=np.int64)
@@ -102,7 +115,7 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "cv_report.json").write_text(json.dumps(json_safe(report), indent=2) + "\n")
     with (args.out / "oof_predictions.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["fold", "recording", "label", "prob"])
+        w = csv.DictWriter(f, fieldnames=["fold", "patient_id", "location", "recording", "label", "prob"])
         w.writeheader()
         w.writerows(pred_rows)
     print(f"wrote {args.out}/cv_report.json ({report['ensemble_size']}-member ensemble, "
