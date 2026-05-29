@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from openstetho_model.regression_gate import (
+    BLOCKED,
     IMPROVED,
     PASS,
     REGRESSED,
@@ -107,13 +108,51 @@ def test_shipped_ensemble_beats_prior_baseline() -> None:
 
 def test_weaker_teacher_lead_no_longer_clears_raised_bar() -> None:
     """The bar rose: the teacher-distilled w=0.20 lead (transferred F1 0.626)
-    no longer beats the clean ensemble baseline (0.644), so the gate rejects it.
-    Confirms the frozen baseline genuinely moved forward.
+    no longer beats the clean ensemble baseline (0.644). It is also teacher-
+    distilled, so the gate BLOCKs it on policy regardless.
     """
     baseline, gate = load_baseline(BASELINE_FILE)
     teacher = _card("logmel_5s_teacher_w020")
     result = compute_gate(baseline, teacher, gate)
     assert result.verdict != IMPROVED
+
+
+def test_teacher_distilled_candidate_is_blocked_even_if_metrics_pass() -> None:
+    """A teacher-distilled candidate is never promotable, even when its metrics
+    beat the bar. Use the prior single-model baseline so the teacher w=0.20 card
+    (transferred F1 0.626 > 0.597) WOULD pass on metrics — yet must BLOCK.
+    """
+    prior = _card("logmel_5s_bce_f1")
+    teacher = _card("logmel_5s_teacher_w020")
+    assert teacher["provenance"]["teacher_distillation"] is True
+
+    _, gate = load_baseline(BASELINE_FILE)
+    result = compute_gate(prior, teacher, gate)
+    assert result.verdict == BLOCKED
+    assert not result.ok
+    assert any("teacher-distilled" in r for r in result.reasons)
+
+
+def test_allow_teacher_distillation_unblocks_for_research_evaluation() -> None:
+    """With the opt-in flag, a teacher card is evaluated on metrics (so it can be
+    read as a research lead) instead of being policy-blocked."""
+    prior = _card("logmel_5s_bce_f1")
+    teacher = _card("logmel_5s_teacher_w020")
+    _, gate = load_baseline(BASELINE_FILE)
+
+    result = compute_gate(prior, teacher, {**gate, "allow_teacher_distillation": True})
+    assert result.verdict != BLOCKED
+    assert result.verdict == IMPROVED
+
+
+def test_clean_candidate_is_unaffected_by_teacher_policy() -> None:
+    """A non-teacher card never trips the policy block."""
+    prior = _card("logmel_5s_bce_f1")
+    shipped = _card("logmel_5s_ensemble3")
+    assert shipped["provenance"]["teacher_distillation"] is False
+    _, gate = load_baseline(BASELINE_FILE)
+    result = compute_gate(prior, shipped, gate)
+    assert result.verdict == IMPROVED
 
 
 def test_extract_scorecard_is_faithful_and_graceful() -> None:

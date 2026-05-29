@@ -43,11 +43,18 @@ DEFAULT_GATE: dict[str, Any] = {
         "platt_auroc",
         "platt_tt_spec90_sensitivity",
     ],
+    # Promotion is reserved for clean public-data recipes. A teacher-distilled
+    # candidate (its scorecard sets provenance.teacher_distillation) is never
+    # promotable, regardless of metrics. Set True only to evaluate such a card
+    # as a research lead (it still cannot become the frozen baseline).
+    "allow_teacher_distillation": False,
 }
 
 IMPROVED = "IMPROVED"
 PASS = "PASS"
 REGRESSED = "REGRESSED"
+# Not promotable on policy grounds (teacher distillation), independent of metrics.
+BLOCKED = "BLOCKED"
 
 
 @dataclass
@@ -69,7 +76,7 @@ class GateResult:
 
     @property
     def ok(self) -> bool:
-        return self.verdict != REGRESSED
+        return self.verdict not in (REGRESSED, BLOCKED)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +149,22 @@ def compute_gate(
         reasons.append(
             f"primary '{primary_name}' within band (Δ{primary.delta:+.4f}); no regression"
         )
+
+    # Policy override: a teacher-distilled candidate is never promotable, even
+    # if its metrics clear the bar. Deltas above are still reported so the card
+    # can be read as a research lead, but the verdict refuses promotion unless
+    # explicitly allowed for evaluation.
+    teacher = bool(candidate.get("provenance", {}).get("teacher_distillation"))
+    if teacher and not gate.get("allow_teacher_distillation", False):
+        reasons.insert(
+            0,
+            "candidate is teacher-distilled (provenance.teacher_distillation=true): "
+            "not promotable to the clean public baseline "
+            f"(metric verdict would have been {verdict}); "
+            "pass allow_teacher_distillation to evaluate it as a research lead",
+        )
+        verdict = BLOCKED
+
     return GateResult(verdict=verdict, primary=primary, guards=guards, reasons=reasons)
 
 
@@ -178,9 +201,16 @@ def main() -> None:
     p.add_argument("--baseline", type=Path, required=True, help="frozen baseline file (scorecard + gate)")
     p.add_argument("--candidate", type=Path, required=True, help="candidate scorecard JSON")
     p.add_argument("--json", type=Path, default=None, help="optional path to write the gate result JSON")
+    p.add_argument(
+        "--allow-teacher",
+        action="store_true",
+        help="evaluate a teacher-distilled candidate as a research lead; it still cannot be promoted",
+    )
     args = p.parse_args()
 
     baseline_card, gate = load_baseline(args.baseline)
+    if args.allow_teacher:
+        gate = {**gate, "allow_teacher_distillation": True}
     candidate_card = json.loads(args.candidate.read_text())
     result = compute_gate(baseline_card, candidate_card, gate)
 
