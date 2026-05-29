@@ -874,11 +874,15 @@ uv run --project model python -m openstetho_model.regression_gate \
     --candidate model/benchmarks/scorecards/<id>.json
 ```
 
-**Promotion is reserved for clean public-data recipes** — the baseline file
-enforces `teacher_distillation == false` via the test suite. The teacher-distilled
-CirCor2022 w=0.20 run (transferred F1 `0.626`) was gate-IMPROVED over the v1
-baseline but is *not* promotable; it stays a documented research lead, and it
-no longer clears the raised v2 bar (`0.644`).
+**Promotion is reserved for clean public-data recipes.** This is enforced in two
+places: the test suite asserts the frozen baseline has `teacher_distillation == false`,
+and `compute_gate` itself returns a dedicated **`BLOCKED`** verdict (CLI exit 1)
+for any candidate whose scorecard sets `provenance.teacher_distillation`, even if
+its metrics clear the bar. To evaluate a teacher-distilled card as a research
+lead (not for promotion), pass `--allow-teacher`. The teacher-distilled CirCor2022
+w=0.20 run (transferred F1 `0.626`) was gate-IMPROVED over the v1 single-model
+baseline under `--allow-teacher`, but it is `BLOCKED` by default and no longer
+clears the raised v2 bar (`0.644`) regardless.
 
 ## Clean Win: Seed-Ensemble Promotion (v1 -> v2 baseline)
 
