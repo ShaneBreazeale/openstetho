@@ -139,7 +139,11 @@ def export_ensemble(
         "architecture": "cnn_bigru_ensemble",
         "ensemble_size": len(checkpoints),
         "ensemble_members": [str(c) for c in checkpoints],
-        "aggregation": "prob_mean",
+        # window_aggregation = how the fused model combines its members per
+        # window (probability mean). murmur_aggregation = how stetho-ui combines
+        # per-window probabilities across a session before thresholding.
+        "window_aggregation": "prob_mean",
+        "murmur_aggregation": "mean",
         "window_seconds": window_seconds,
         "n_frames": n_frames,
         "n_mels": N_MELS,
