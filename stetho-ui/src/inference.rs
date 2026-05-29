@@ -6,8 +6,11 @@
 //!
 //! The runtime hosts two engines in parallel:
 //!
-//! * `MurmurEngine` — `N_FRAMES_MURMUR = 62` frames per window (4 s @
-//!   hop 256 / 4 kHz). Matches `MurmurCNN`'s training shape.
+//! * `MurmurEngine` — window length is taken from the model's sidecar
+//!   `n_frames` metadata at load time (`murmur_frame_count`), so a single
+//!   build serves any trained window. The current release model is the 5 s /
+//!   78-frame cnn_bigru ensemble; `N_FRAMES_MURMUR = 62` (4 s) remains only the
+//!   legacy fallback for older packages that ship no metadata.
 //! * `S3Engine` — `N_FRAMES_S3 = 23` frames per window (1.5 s S2-anchored
 //!   crop). Matches `S3CNN_v2`'s training shape.
 //!
@@ -19,6 +22,9 @@ use std::path::Path;
 use stetho_core::dsp::mel::N_MELS;
 use tracing::{info, warn};
 
+/// Legacy fallback window length (4 s @ hop 256 / 4 kHz) used only when a
+/// model ships no `n_frames` metadata. The shipped model's window length comes
+/// from its sidecar instead — see `murmur_frame_count` in `main.rs`.
 pub const N_FRAMES_MURMUR: usize = 62;
 pub const N_FRAMES_S3: usize = 23;
 

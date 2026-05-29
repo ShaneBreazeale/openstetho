@@ -829,17 +829,229 @@ BCE F1/Youden lead. If revisited, try stronger regularization on the wide
 branch, a late-fusion/calibration-only use of the wide features, or freezing
 the acoustic head before fitting the side branch.
 
+## Regression Gate (proving improvement, not just running experiments)
+
+Every result above was produced by hand and pasted into this note. There was
+no committed, machine-checkable definition of "this model is better than the
+last one." The regression gate closes that loop.
+
+Two small modules and a committed baseline turn each `cv_report.json` into a
+provable claim:
+
+- `openstetho_model.scorecard` — projects a (large, gitignored, schema-drifting)
+  `cv_report.json` into a flat, committable **scorecard** of canonical metrics
+  plus provenance. Missing sections (e.g. older runs without
+  `cross_fold_calibration`) extract as `null` instead of raising.
+- `openstetho_model.regression_gate` — compares a candidate scorecard against
+  the frozen baseline under a gate policy and returns `IMPROVED` / `PASS` /
+  `REGRESSED`. The CLI exits non-zero on `REGRESSED`.
+- `model/benchmarks/murmur_baseline.json` — the frozen baseline scorecard
+  **bundled with** the gate policy, so the rule travels with the number.
+- `model/benchmarks/scorecards/*.json` — committed candidate scorecards.
+- `model/tests/test_regression_gate.py` — offline pytest (no data/GPU) that
+  fails CI on a regression.
+
+Gate policy (decided, see commit): primary metric is the calibrated,
+fold-held-out **transferred best-F1** (`platt_tt_bestf1_f1`) — the
+least-optimistic deployable operating point. Improvement margin `0.005`. Guard
+metrics `oof_auroc`, `platt_auroc`, `platt_tt_spec90_sensitivity` may not drop
+more than `0.01`, so a candidate cannot trade ranking or screening recall for
+F1.
+
+Frozen baseline (v2): the clean, public-data-only **3-seed bagged ensemble** of
+the 5s log-mel CNN+BiGRU BCE/F1 recipe (`logmel_5s_ensemble3`). See the next
+section for how it was produced.
+
+Refresh a scorecard and run the gate:
+
+```bash
+uv run --project model python -m openstetho_model.scorecard \
+    model/runs/<run>/cv_report.json --name <id> \
+    --out model/benchmarks/scorecards/<id>.json
+
+uv run --project model python -m openstetho_model.regression_gate \
+    --baseline model/benchmarks/murmur_baseline.json \
+    --candidate model/benchmarks/scorecards/<id>.json
+```
+
+**Promotion is reserved for clean public-data recipes** — the baseline file
+enforces `teacher_distillation == false` via the test suite. The teacher-distilled
+CirCor2022 w=0.20 run (transferred F1 `0.626`) was gate-IMPROVED over the v1
+baseline but is *not* promotable; it stays a documented research lead, and it
+no longer clears the raised v2 bar (`0.644`).
+
+## Clean Win: Seed-Ensemble Promotion (v1 -> v2 baseline)
+
+An augmentation candidate (train-fold SpecAugment + noise + time-shift on the
+proven 5s log-mel recipe) was trained and gated first. It **regressed**: fold
+val AUROC rose to `0.839` but pooled calibrated transferred F1 fell to `0.560`
+(`platt_auroc` and `spec90` sensitivity also down). This is the same
+fold-vs-pooled optimism seen with the wide-feature and 15s `logmel128` runs;
+the gate caught it automatically and it was not promoted.
+
+The clean win came from **seed bagging**. `--seed` controls the fold split,
+model init, and sampler, so three runs at seeds 0/1/2 of the identical clean
+recipe are well-decorrelated. `openstetho_model.ensemble_oof` averages the
+per-recording out-of-fold probabilities (each prediction is still out-of-fold,
+so averaging is valid) and rescoring with the same `summarize` /
+`cross_fold_calibration_report` path yields a drop-in `cv_report.json`.
+
+```bash
+# seeds 1 and 2 (seed 0 is the existing logmel_5s_bce_f1 run)
+for s in 1 2; do
+  uv run --project model python -m openstetho_model.cv_murmur \
+      --data $CIRCOR_ROOT --architecture cnn_bigru --feature-mode logmel \
+      --window-seconds 5 --aggregation mean --folds 5 --epochs 8 \
+      --batch-size 16 --workers 0 --device mps --no-cardiac \
+      --loss bce --lr 3e-4 --grad-clip-norm 5 --select-metric f1 \
+      --lr-scheduler plateau --plateau-patience 1 --plateau-factor 0.5 \
+      --early-stopping-patience 2 --seed $s \
+      --out model/runs/murmur_cv_logmel_5s_seed$s
+done
+
+uv run --project model python -m openstetho_model.ensemble_oof \
+    --runs model/runs/murmur_cv_logmel_5s_bce_select_f1_v1 \
+           model/runs/murmur_cv_logmel_5s_seed1 \
+           model/runs/murmur_cv_logmel_5s_seed2 \
+    --out model/runs/murmur_cv_logmel_5s_ensemble_v1
+```
+
+Gate verdict, frozen v1 baseline vs the clean 3-seed ensemble:
+
+```text
+verdict: IMPROVED
+  metric                      role     baseline candidate    delta  status
+  platt_tt_bestf1_f1          primary   0.5972   0.6439   +0.0467  improved
+  oof_auroc                   guard     0.8172   0.8415   +0.0243  improved
+  platt_auroc                 guard     0.8137   0.8406   +0.0269  improved
+  platt_tt_spec90_sensitivity guard     0.5809   0.6452   +0.0644  improved
+```
+
+Every gate metric improved with no teacher signal, and calibration error
+roughly halved (Platt ECE-10 `0.040 -> 0.019`). The ensemble also beats the
+teacher-distilled w=0.20 lead (`0.6439 > 0.6264`) on clean public data, so it
+is now the strongest result in this thread and the frozen v2 baseline.
+
+Deployment note: the v2 baseline is a research/benchmark lead. Shipping it as a
+single Core ML artifact needs either multi-model export or distilling the
+ensemble into one student — that is the next deployment step. The released
+app-facing checkpoint is governed separately and is unchanged.
+
+## Distillation to a Single Deployable Model (negative, gate-rejected)
+
+The v2 ensemble is a research/benchmark lead but not a single Core ML artifact.
+The clean route to a deployable single model is distillation: train one student
+to mimic the ensemble's out-of-fold soft targets (teacher = our own ensemble on
+public CirCor, not a vendor model). `ensemble_oof.py` now also emits
+`patient_id`/`location`, so its OoF CSV is a drop-in teacher for
+`cv_murmur --teacher-predictions-csv ... --teacher-prob-column prob`. The OoF
+targets are leak-free (each came from models that did not train on that
+recording), and coverage is full (2964/2964).
+
+A distill-weight sweep was gated against the **prior single-model** baseline
+(`logmel_5s_bce_f1`, transferred F1 `0.5972`):
+
+| distill weight | verdict | transferred F1 | OoF AUROC | Platt AUROC | spec>=0.90 sens | Platt ECE |
+|---:|---|---:|---:|---:|---:|---:|
+| 0.1 | REGRESSED | 0.3795 | 0.7723 | 0.7498 | 0.4950 | 0.0715 |
+| 0.2 | REGRESSED | 0.5564 | 0.8245 | 0.8123 | 0.5809 | 0.0234 |
+| 0.5 | REGRESSED | 0.5532 | 0.8064 | 0.7840 | 0.5627 | 0.0252 |
+| 1.0 | REGRESSED | 0.5618 | 0.7933 | 0.7715 | 0.5561 | 0.0529 |
+
+All four regressed on the gated primary. High weights (0.5/1.0) inflate the loss
+scale and destabilize pooled ranking (the recurring fold-vs-pooled optimism:
+fold val AUROC reached ~0.85 while pooled OoF fell). The best point, `w=0.2`, is
+a **lateral move, not a win**: OoF AUROC nudges up (`0.8245` vs `0.8172`) and
+calibration improves markedly (ECE `0.0234` vs `0.0396`), but the calibrated
+transferred best-F1 drops to `0.5564` because that operating point shifts toward
+sensitivity (transferred specificity `0.94 -> 0.885`). It does help the
+high-recall screening point (`sens>=0.80` specificity `0.642 -> 0.665`).
+
+Conclusion: a single distilled student does not beat the prior single model on
+the gated primary metric at any tested weight. The clean shipped win remains the
+3-seed ensemble. To deploy it, prefer multi-model Core ML export (run the three
+checkpoints, average logits) over distillation. If distillation is revisited,
+try specificity-oriented checkpoint selection (the gap is operating-point, not
+ranking), distillation temperature, or distilling from per-window rather than
+recording-level teacher targets.
+
+## Deployment: Fused Ensemble Export (Option B, built)
+
+The clean ensemble ships as a single Core ML artifact with the averaging baked
+in -- no multi-file app change, just a fused mlprogram.
+
+Two pieces:
+
+1. Deployment checkpoints. The CV ensemble is out-of-fold (15 fold-models); it
+   is a generalization *estimate*, not deployable weights. For deployment, train
+   one full-data model per seed with the identical clean recipe
+   (`train.py --level recording`, seeds 0/1/2 -> `runs/murmur_deploy_seed{0,1,2}/best.pt`).
+2. Fused export. `openstetho_model.export_ensemble` loads the N members, wraps
+   them in `ProbMeanEnsemble`, and converts to one `.mlpackage`. It averages
+   member **probabilities** and re-encodes the mean as a logit
+   (`logit(mean(sigmoid(member)))`), so the app's existing `sigmoid(output)`
+   step recovers the mean member probability -- exactly what `ensemble_oof`
+   scored. The app contract is unchanged: one `log_mel` input, one
+   `murmur_logit` output.
+
+```bash
+uv run --project model python -m openstetho_model.export_ensemble \
+    --checkpoints runs/murmur_deploy_seed0/best.pt \
+                  runs/murmur_deploy_seed1/best.pt \
+                  runs/murmur_deploy_seed2/best.pt \
+    --window-seconds 5 \
+    --out runs/release-ensemble-v2/MurmurCNN.mlpackage --verify
+```
+
+Parity check (PyTorch fused ensemble vs exported Core ML, random input):
+
+```text
+torch_logit  -1.9128   coreml_logit  -1.9121
+max_abs_diff  0.0007    coreml_latency_ms  ~19 (3 members fused)
+```
+
+The exported package discriminates end-to-end through the 5 s / 78-frame Core ML
+path (in-sample sanity bench; the unbiased performance claim remains the CV
+estimate, transferred F1 `0.644`).
+
+### Release is gated on a stetho-ui window-length change (NOT yet shipped)
+
+The released contract is 4 s / 62 frames `(1,1,62,32)`. This ensemble is
+**5 s / 78 frames** `(1,1,78,32)`. The GitHub release asset name is hardcoded
+(`MurmurCNN.mlpackage.zip`) and installs auto-upgrade via
+`/releases/latest/download/`, so publishing the 5 s package **before** the UI is
+updated would feed 62-frame input to a 78-frame model and break every install.
+
+Before packaging/publishing this artifact:
+
+- update `MurmurEngine` in `stetho-ui` to a 5 s / 78-frame window (mel framing +
+  rolling buffer length), keeping the z-scored-frame-to-inference contract;
+- set the app's default operating threshold from the ensemble's calibrated
+  transfer numbers (it is better calibrated, ECE `0.019`), not the old 4 s value;
+- re-run Rust/Python mel parity (`dump_mel_parity.rs` + `test_parity.py`);
+- only then `scripts/package_model_release.sh runs/release-ensemble-v2/MurmurCNN.mlpackage`
+  and publish.
+
+The export tooling, deployment recipe, and parity check are committed; the
+binary `.mlpackage` is gitignored and the release step is intentionally left for
+the coordinated UI change.
+
 ## Current Recommendation
 
+- The clean, gate-promoted lead is now the **3-seed bagged ensemble** of the 5s
+  log-mel CNN+BiGRU BCE/F1 recipe (frozen v2 baseline, `logmel_5s_ensemble3`):
+  pooled OoF AUROC `0.842`, calibrated transferred F1 `0.644`, Platt ECE `0.019`.
+  It is public-data-only and beats both the prior single-model baseline and the
+  teacher-distilled w=0.20 run.
 - Do not replace the app model with the earlier `murmur_recording_top3_v1`
   checkpoint; its full benchmark AUROC was below 0.5.
-- Treat the 5s log-mel CNN+BiGRU with CirCor2022 positive-only soft-target
-  weight `0.20`, BCE loss, and F1 checkpoint selection as the current
-  research lead. It has the best pooled OoF AUROC and best transferred F1 so
-  far, but it is a local CirCor2022-assisted experiment rather than a clean
-  public recipe.
-- Keep the no-soft-target 5s log-mel BCE F1/Youden model as the clean
-  baseline and fallback lead for publishable training notes.
+- The CirCor2022 positive-only soft-target w=0.20 run remains a documented but
+  non-promotable research lead (teacher-distilled, and now below the v2 bar).
+- The single-model no-soft-target 5s log-mel BCE F1/Youden model is the v1
+  baseline, superseded by the ensemble but kept as the committed prior-baseline
+  scorecard for the regression proof.
+- Seed bagging was the clean lever that worked; train-fold augmentation on the
+  same recipe regressed pooled transferred metrics and was rejected by the gate.
 - Keep the released app-facing checkpoint unchanged until the 5s log-mel
   CNN+BiGRU path has an export/deployment plan.
 - The 5s MFCC single-split result did not hold up as a pooled OoF

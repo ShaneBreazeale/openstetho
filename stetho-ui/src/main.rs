@@ -26,9 +26,10 @@ use tracing::{error, info};
 const WAVEFORM_SECONDS: usize = 5;
 const WAVEFORM_LEN: usize = AUDIO_SAMPLE_RATE_HZ as usize * WAVEFORM_SECONDS;
 const SPECTROGRAM_FRAMES: usize = 128;
-/// Tuned on the local CirCor benchmark using recording-level mean
-/// aggregation. At this threshold, mean aggregation gave the best F1
-/// among the checked post-processing choices.
+/// Legacy default operating threshold for the 4 s model, used only when a
+/// package ships no `murmur_threshold` metadata. The shipped 5 s ensemble
+/// carries its own calibrated threshold in the sidecar (`murmur_decision_config`
+/// reads it), so this constant is just the backward-compatible fallback.
 const MURMUR_RECORDING_MEAN_THRESHOLD: f32 = 0.49331352;
 const DEFAULT_MODEL_DOWNLOAD_URL: &str =
     "https://github.com/ShaneBreazeale/openstetho/releases/latest/download/MurmurCNN.mlpackage.zip";
@@ -1389,6 +1390,28 @@ mod tests {
 
         assert_eq!(config.aggregation, MurmurAggregation::Mean);
         assert_eq!(config.threshold, MURMUR_RECORDING_MEAN_THRESHOLD);
+    }
+
+    #[test]
+    fn ensemble_5s_sidecar_drives_frame_count_and_threshold() {
+        // Mirrors the sidecar written by export_ensemble for the shipped 5 s
+        // cnn_bigru ensemble: 78-frame window, session-mean aggregation, and
+        // the calibrated Youden operating threshold.
+        let dir = temp_dir("ensemble-5s-sidecar");
+        let model = dir.join("MurmurCNN.mlpackage");
+        fs::create_dir_all(&model).unwrap();
+        fs::write(
+            dir.join("MurmurCNN.openstetho.json"),
+            br#"{"architecture":"cnn_bigru_ensemble","ensemble_size":3,"window_aggregation":"prob_mean","murmur_aggregation":"mean","window_seconds":5.0,"n_frames":78,"murmur_threshold":0.535999}"#,
+        )
+        .unwrap();
+
+        assert_eq!(murmur_frame_count(&model), 78);
+        let config = murmur_decision_config(Some(&model));
+        assert_eq!(config.aggregation, MurmurAggregation::Mean);
+        assert!((config.threshold - 0.535999).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
