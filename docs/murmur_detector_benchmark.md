@@ -975,6 +975,67 @@ try specificity-oriented checkpoint selection (the gap is operating-point, not
 ranking), distillation temperature, or distilling from per-window rather than
 recording-level teacher targets.
 
+## Deployment: Fused Ensemble Export (Option B, built)
+
+The clean ensemble ships as a single Core ML artifact with the averaging baked
+in -- no multi-file app change, just a fused mlprogram.
+
+Two pieces:
+
+1. Deployment checkpoints. The CV ensemble is out-of-fold (15 fold-models); it
+   is a generalization *estimate*, not deployable weights. For deployment, train
+   one full-data model per seed with the identical clean recipe
+   (`train.py --level recording`, seeds 0/1/2 -> `runs/murmur_deploy_seed{0,1,2}/best.pt`).
+2. Fused export. `openstetho_model.export_ensemble` loads the N members, wraps
+   them in `ProbMeanEnsemble`, and converts to one `.mlpackage`. It averages
+   member **probabilities** and re-encodes the mean as a logit
+   (`logit(mean(sigmoid(member)))`), so the app's existing `sigmoid(output)`
+   step recovers the mean member probability -- exactly what `ensemble_oof`
+   scored. The app contract is unchanged: one `log_mel` input, one
+   `murmur_logit` output.
+
+```bash
+uv run --project model python -m openstetho_model.export_ensemble \
+    --checkpoints runs/murmur_deploy_seed0/best.pt \
+                  runs/murmur_deploy_seed1/best.pt \
+                  runs/murmur_deploy_seed2/best.pt \
+    --window-seconds 5 \
+    --out runs/release-ensemble-v2/MurmurCNN.mlpackage --verify
+```
+
+Parity check (PyTorch fused ensemble vs exported Core ML, random input):
+
+```text
+torch_logit  -1.9128   coreml_logit  -1.9121
+max_abs_diff  0.0007    coreml_latency_ms  ~19 (3 members fused)
+```
+
+The exported package discriminates end-to-end through the 5 s / 78-frame Core ML
+path (in-sample sanity bench; the unbiased performance claim remains the CV
+estimate, transferred F1 `0.644`).
+
+### Release is gated on a stetho-ui window-length change (NOT yet shipped)
+
+The released contract is 4 s / 62 frames `(1,1,62,32)`. This ensemble is
+**5 s / 78 frames** `(1,1,78,32)`. The GitHub release asset name is hardcoded
+(`MurmurCNN.mlpackage.zip`) and installs auto-upgrade via
+`/releases/latest/download/`, so publishing the 5 s package **before** the UI is
+updated would feed 62-frame input to a 78-frame model and break every install.
+
+Before packaging/publishing this artifact:
+
+- update `MurmurEngine` in `stetho-ui` to a 5 s / 78-frame window (mel framing +
+  rolling buffer length), keeping the z-scored-frame-to-inference contract;
+- set the app's default operating threshold from the ensemble's calibrated
+  transfer numbers (it is better calibrated, ECE `0.019`), not the old 4 s value;
+- re-run Rust/Python mel parity (`dump_mel_parity.rs` + `test_parity.py`);
+- only then `scripts/package_model_release.sh runs/release-ensemble-v2/MurmurCNN.mlpackage`
+  and publish.
+
+The export tooling, deployment recipe, and parity check are committed; the
+binary `.mlpackage` is gitignored and the release step is intentionally left for
+the coordinated UI change.
+
 ## Current Recommendation
 
 - The clean, gate-promoted lead is now the **3-seed bagged ensemble** of the 5s
