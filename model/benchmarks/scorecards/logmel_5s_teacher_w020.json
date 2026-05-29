@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "name": "logmel_5s_teacher_w020",
+  "source": "runs/murmur_cv_logmel_5s_teacher_posdistill_v1/cv_report.json",
+  "config": {
+    "feature_mode": "logmel",
+    "architecture": "cnn_bigru",
+    "window_seconds": 5.0,
+    "hop_seconds": 2.5,
+    "aggregation": "mean",
+    "loss": "bce",
+    "select_metric": "f1",
+    "epochs": 8,
+    "wide_features": false,
+    "n_recordings": 2964,
+    "positives": 606
+  },
+  "metrics": {
+    "fold_auc_mean": 0.8409006108261424,
+    "fold_auc_std": 0.01595655644198812,
+    "oof_auroc": 0.8293177918300736,
+    "oof_bestf1_f1": 0.642578125,
+    "oof_bestf1_sensitivity": 0.5429042904290429,
+    "oof_bestf1_specificity": 0.96225614927905,
+    "platt_auroc": 0.8233840559628481,
+    "platt_ece_10": 0.03342835484247717,
+    "platt_brier": 0.10176606484475142,
+    "platt_tt_bestf1_f1": 0.6263537906137184,
+    "platt_tt_bestf1_sensitivity": 0.5726072607260726,
+    "platt_tt_bestf1_specificity": 0.9342663273960984,
+    "platt_tt_spec90_sensitivity": 0.6287128712871287,
+    "platt_tt_spec90_specificity": 0.8867684478371501,
+    "platt_tt_sens80_specificity": 0.6556403731976251
+  },
+  "provenance": {
+    "has_cross_fold_calibration": true,
+    "teacher_distillation": true
+  }
+}

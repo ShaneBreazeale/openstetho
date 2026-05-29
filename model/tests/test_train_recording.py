@@ -299,7 +299,10 @@ def test_cross_fold_calibration_reports_transfer_metrics():
     assert set(report) == {"none", "platt", "isotonic"}
     none_report = report["none"]
     assert none_report["probability"]["auroc"] == 1.0
-    assert set(none_report["threshold_transfer"]) == {
+    # Core policies must always be present; the set may grow with added
+    # specificity targets (e.g. specificity_ge_0_93/94/95), so assert a
+    # superset rather than exact equality to avoid brittleness.
+    assert set(none_report["threshold_transfer"]) >= {
         "best_f1",
         "best_youden_j",
         "sensitivity_ge_0_80",

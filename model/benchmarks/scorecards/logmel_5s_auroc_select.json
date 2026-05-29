@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "logmel_5s_auroc_select",
+  "source": "runs/murmur_cv_logmel_5s_v1/cv_report.json",
+  "config": {
+    "feature_mode": "logmel",
+    "architecture": "cnn_bigru",
+    "window_seconds": 5.0,
+    "hop_seconds": 2.5,
+    "aggregation": "mean",
+    "epochs": 8,
+    "n_recordings": 2964,
+    "positives": 606
+  },
+  "metrics": {
+    "fold_auc_mean": 0.824760387678972,
+    "fold_auc_std": 0.02708891592876717,
+    "oof_auroc": 0.8088075983170837,
+    "oof_bestf1_f1": 0.5922480620155038,
+    "oof_bestf1_sensitivity": 0.6303630363036303,
+    "oof_bestf1_specificity": 0.8719253604749788,
+    "platt_auroc": null,
+    "platt_ece_10": null,
+    "platt_brier": null,
+    "platt_tt_bestf1_f1": null,
+    "platt_tt_bestf1_sensitivity": null,
+    "platt_tt_bestf1_specificity": null,
+    "platt_tt_spec90_sensitivity": null,
+    "platt_tt_spec90_specificity": null,
+    "platt_tt_sens80_specificity": null
+  },
+  "provenance": {
+    "has_cross_fold_calibration": false,
+    "teacher_distillation": false
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "_comment": "Frozen regression baseline for the murmur detector. v2 is a clean, public-data-only 3-seed bagged ensemble of the 5s log-mel CNN+BiGRU BCE/F1 recipe (seeds 0/1/2 = runs/murmur_cv_logmel_5s_bce_select_f1_v1 + _seed1 + _seed2), averaged out-of-fold via openstetho_model.ensemble_oof. It is gate-IMPROVED over the v1 single-model baseline AND over the teacher-distilled w=0.20 research lead, with no teacher signal. Deployment note: the ensemble is a research/benchmark baseline; shipping it as a single Core ML artifact needs either multi-model export or distillation into one student (future work). The released app checkpoint is governed separately (see docs/murmur_detector_benchmark.md). Teacher-distilled candidates must NOT be frozen here. To promote: run regression_gate, confirm IMPROVED, replace the scorecard block, bump baseline_version.",
+  "baseline_version": 2,
+  "gate": {
+    "primary_metric": "platt_tt_bestf1_f1",
+    "improvement_margin": 0.005,
+    "guard_tolerance": 0.01,
+    "guard_metrics": [
+      "oof_auroc",
+      "platt_auroc",
+      "platt_tt_spec90_sensitivity"
+    ]
+  },
+  "scorecard": {
+    "schema_version": 1,
+    "name": "logmel_5s_ensemble3",
+    "source": "runs/murmur_cv_logmel_5s_ensemble_v1/cv_report.json",
+    "config": {
+      "feature_mode": "logmel",
+      "architecture": "cnn_bigru",
+      "aggregation": "mean",
+      "n_recordings": 2964,
+      "positives": 606
+    },
+    "metrics": {
+      "fold_auc_mean": null,
+      "fold_auc_std": null,
+      "oof_auroc": 0.8415407698530668,
+      "oof_bestf1_f1": 0.6539509536784741,
+      "oof_bestf1_sensitivity": 0.594059405940594,
+      "oof_bestf1_specificity": 0.9427480916030534,
+      "platt_auroc": 0.8405631275595753,
+      "platt_ece_10": 0.019167105792855448,
+      "platt_brier": 0.09764930055399063,
+      "platt_tt_bestf1_f1": 0.6439114391143912,
+      "platt_tt_bestf1_sensitivity": 0.5759075907590759,
+      "platt_tt_bestf1_specificity": 0.94529262086514,
+      "platt_tt_spec90_sensitivity": 0.6452145214521452,
+      "platt_tt_spec90_specificity": 0.9003392705682782,
+      "platt_tt_sens80_specificity": 0.7073791348600509
+    },
+    "provenance": {
+      "has_cross_fold_calibration": true,
+      "teacher_distillation": false
+    }
+  }
+}
