@@ -1040,6 +1040,92 @@ The export tooling, deployment recipe, and parity check are committed; the
 binary `.mlpackage` is gitignored and the release step is intentionally left for
 the coordinated UI change.
 
+## Channel Simulation + Synthetic Murmurs (negative, gate-rejected)
+
+Train-only augmentation aimed at device robustness, applied to the v2
+ensemble recipe (same args, seeds 0/1/2, 5-fold patient CV):
+
+- `--eq-prob 0.5`: one random smooth EQ per recording (`channel.py`).
+- `--adpcm-prob 0.25`: one BLE IMA-ADPCM round trip per recording at a
+  random level; the Python codec is pinned bit for bit to `stetho-core`
+  (`examples/adpcm_vectors.rs`, `tests/test_channel.py`).
+- `--synth-fraction 0.3 --synth-murmur-share 0.5`: 4 of 16 recordings in each
+  batch are synthetic (`recording_mix.py`). Half have a band-limited murmur
+  inserted into the annotated systole/diastole of a train-fold Murmur-Absent
+  recording at -15 to 0 dB vs S1/S2 (`murmur_synth.py`). The other half are
+  no-heart signals (silence, coloured noise, hum, rub).
+
+```bash
+uv run --project model python -m openstetho_model.cv_murmur \
+    --data $CIRCOR_ROOT --architecture cnn_bigru --feature-mode logmel \
+    --window-seconds 5 --aggregation mean --folds 5 --epochs 8 \
+    --batch-size 16 --workers 0 --device mps --no-cardiac \
+    --loss bce --lr 3e-4 --grad-clip-norm 5 --select-metric f1 \
+    --lr-scheduler plateau --plateau-patience 1 --plateau-factor 0.5 \
+    --early-stopping-patience 2 --eq-prob 0.5 --adpcm-prob 0.25 \
+    --synth-fraction 0.3 --synth-murmur-share 0.5 --seed $s \
+    --out model/runs/murmur_cv_logmel_5s_chsynth_seed$s
+```
+
+Run seeds one at a time on a 16 GB machine. Three in parallel ran out of
+memory in fold 5; `--resume` reuses finished folds.
+
+Gate verdict, frozen v2 baseline vs the 3-seed augmented ensemble
+(`benchmarks/scorecards/logmel_5s_chsynth_ensemble3.json`):
+
+```text
+verdict: REGRESSED
+  metric                      role     baseline candidate    delta  status
+  platt_tt_bestf1_f1          primary   0.6439   0.6163  -0.0277  regressed
+  oof_auroc                   guard     0.8415   0.8328  -0.0088  ok
+  platt_auroc                 guard     0.8406   0.8282  -0.0124  regressed
+  platt_tt_spec90_sensitivity guard     0.6452   0.6205  -0.0248  regressed
+```
+
+On CirCor itself the augmentation costs ranking and the deployable operating
+point. This matches the earlier train-fold augmentation result. CirCor has
+no device-shift test set, so any robustness gain it buys is unmeasured here.
+Not promoted.
+
+### Ensemble calibration (tooling, no new weights)
+
+`calibrate_ensemble` fits identity / temperature / Platt on an ensemble's OoF
+CSV by patient-grouped cross-fitting and maps the operating threshold through
+the same monotone map. `export_ensemble --calibration` bakes the map into the
+fused Core ML graph. On the v2 ensemble it picks Platt (`1.195*z - 1.501`).
+OoF NLL drops `0.482 -> 0.335` and the calibration line goes from
+`1.20/-1.50` to `1.00/0.00`. The raw ensemble overstates murmur probability
+(the pos_weight bias is never undone).
+
+The mapped threshold (`0.536 -> 0.209`) only preserves decisions at recording
+level. stetho-ui averages per-window probabilities, and averaging after a
+non-linear map shifts the mean. With `0.209`, 9 % of CirCor recordings
+flipped from negative to positive in the app's aggregation (specificity
+`0.645 -> 0.540`). Re-matching the threshold on the app's scale gives `0.258`
+and reproduces v0.4.0 decisions on 95.9 % of recordings: sensitivity
+unchanged at `0.886`, specificity `0.645 -> 0.633` (deploy models, in-sample).
+No threshold reaches 100 %, because the two aggregations rank recordings
+slightly differently.
+
+Released as `v0.4.1-murmur-calibrated` (same weights as v0.4.0, Platt map
+baked in, `murmur_threshold` 0.258, same S3 model):
+
+```bash
+uv run --project model python -m openstetho_model.calibrate_ensemble \
+    --oof runs/murmur_cv_logmel_5s_ensemble_v1/oof_predictions.csv \
+    --out runs/release-ensemble-v2-cal/calibration.json
+uv run --project model python -m openstetho_model.export_ensemble \
+    --checkpoints runs/murmur_deploy_seed{0,1,2}/best.pt --window-seconds 5 \
+    --calibration runs/release-ensemble-v2-cal/calibration.json \
+    --murmur-threshold 0.257657 \
+    --out runs/release-ensemble-v2-cal/MurmurCNN.mlpackage --verify
+```
+
+`stetho-ui` now reports "no signal" instead of a murmur score when the RMS of
+the raw audio behind a model window is below -85 dBFS
+(`stetho-core/src/dsp/level.rs`). Silent windows stay out of the session
+aggregate.
+
 ## Current Recommendation
 
 - The clean, gate-promoted lead is now the **3-seed bagged ensemble** of the 5s

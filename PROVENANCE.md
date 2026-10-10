@@ -42,9 +42,28 @@ The scripts under `scripts/download_*.sh` mirror the official
 distribution URLs into a git-ignored `data/` directory. Dataset audio is
 not redistributed in this repo.
 
+Evaluation-only data (never used for training or model selection):
+
+| Dataset | Source | Licence |
+|---|---|---|
+| HLS-CMDS v2 (manikin heart/lung sounds, Littmann CORE) | Torabi, Shirani, Reilly, IEEE Data Descriptions 2025, doi:10.1109/IEEEDATA.2025.3566012; GitHub `Torabiy/HLS-CMDS` | MIT (GitHub mirror) |
+
+## Synthetic training signals
+
+`model/openstetho_model/murmur_synth.py`, `channel.py` and
+`recording_mix.py` generate train-only augmentation from public formulas
+and CirCor's own segmentation annotations: band-limited noise murmurs
+inserted into annotated systole/diastole of train-split Murmur-Absent
+recordings, no-heart signals (coloured noise, mains hum, rubbing bursts),
+random smooth EQ curves, and an IMA-ADPCM round trip using the public
+IMA/DVI step and index tables. No vendor data, coefficients or model
+outputs are involved. Synthetic items never enter validation.
+
 ## Test fixtures
 
-Rust codec tests synthesize packet payloads in memory. Committed audio,
+Rust codec tests synthesize packet payloads in memory.
+`model/tests/fixtures/adpcm_rust.txt` is the Rust decoder's output for a
+synthetic nibble sequence (`stetho-core/examples/adpcm_vectors.rs`). Committed audio,
 raw BLE captures, vendor binaries, model weights, and downloaded dataset
 files are intentionally excluded from the repository.
 

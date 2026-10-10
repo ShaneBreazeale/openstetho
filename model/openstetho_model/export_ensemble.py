@@ -61,17 +61,33 @@ class ProbMeanEnsemble(nn.Module):
     Core ML mlprogram.
     """
 
-    def __init__(self, members: list[nn.Module]):
+    def __init__(self, members: list[nn.Module], affine: tuple[float, float] | None = None):
         super().__init__()
         self.members = nn.ModuleList(members)
+        # Optional recalibration `a*logit + b` (see `calibrate_ensemble`),
+        # applied after the probability mean so the benchmarked ensemble is
+        # unchanged up to a monotone map.
+        self.affine = None if affine is None else (float(affine[0]), float(affine[1]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         probs = torch.stack([torch.sigmoid(m(x)) for m in self.members], dim=0)
         mean_p = probs.mean(dim=0).clamp(PROB_EPS, 1.0 - PROB_EPS)
-        return torch.log(mean_p / (1.0 - mean_p))
+        z = torch.log(mean_p / (1.0 - mean_p))
+        if self.affine is not None:
+            z = z * self.affine[0] + self.affine[1]
+        return z
 
 
-def load_members(checkpoints: list[Path]) -> ProbMeanEnsemble:
+def load_calibration(path: Path | None) -> dict | None:
+    if path is None:
+        return None
+    record = json.loads(Path(path).read_text())
+    if record.get("kind") != "openstetho_ensemble_calibration":
+        raise ValueError(f"{path} is not a calibrate_ensemble record")
+    return record
+
+
+def load_members(checkpoints: list[Path], affine: tuple[float, float] | None = None) -> ProbMeanEnsemble:
     members: list[nn.Module] = []
     for ckpt in checkpoints:
         model = MurmurCNNBiGRU()
@@ -79,7 +95,7 @@ def load_members(checkpoints: list[Path]) -> ProbMeanEnsemble:
         model.load_state_dict(state)
         model.train(False)  # inference mode without the blocked .eval() name
         members.append(model)
-    ensemble = ProbMeanEnsemble(members)
+    ensemble = ProbMeanEnsemble(members, affine)
     ensemble.train(False)
     return ensemble
 
@@ -90,14 +106,18 @@ def export_ensemble(
     target_key: str = "iOS17",
     window_seconds: float = 5.0,
     murmur_threshold: float | None = None,
+    calibration: dict | None = None,
 ) -> Path:
     if target_key not in TARGETS:
         raise ValueError(f"unknown target {target_key}; valid: {sorted(TARGETS)}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_frames = n_frames_for_window(window_seconds)
+    affine = None if calibration is None else (float(calibration["a"]), float(calibration["b"]))
+    if calibration is not None and murmur_threshold is None:
+        murmur_threshold = float(calibration["murmur_threshold"])
 
     log.info("loading %d members", len(checkpoints))
-    model = load_members(checkpoints)
+    model = load_members(checkpoints, affine)
     example = torch.zeros(1, 1, n_frames, N_MELS, dtype=torch.float32)
     log.info("tracing fused ensemble at %.3fs (%d frames)", window_seconds, n_frames)
     traced = torch.jit.trace(model, example)
@@ -128,9 +148,20 @@ def export_ensemble(
             f"{window_seconds:g}-s window @ 4 kHz, Hann/256-FFT/no-overlap, 32 Slaney mel bands, "
             "log10x10, per-frame z-score, -80 dB clip."
         )
-        mlmodel.output_description[OUTPUT_NAME] = (
-            "Raw logit; sigmoid(output) == mean of member murmur-present probabilities."
-        )
+        if affine is None:
+            mlmodel.output_description[OUTPUT_NAME] = (
+                "Raw logit; sigmoid(output) == mean of member murmur-present probabilities."
+            )
+        else:
+            mlmodel.output_description[OUTPUT_NAME] = (
+                f"Calibrated logit = {affine[0]:.4f}*logit(mean member prob) {affine[1]:+.4f} "
+                f"({calibration['method']}, fitted on out-of-fold CirCor predictions). "
+                "Apply sigmoid for probability."
+            )
+    if affine is not None:
+        mlmodel.user_defined_metadata["recalibration"] = str(calibration["method"])
+        mlmodel.user_defined_metadata["affine_a"] = repr(affine[0])
+        mlmodel.user_defined_metadata["affine_b"] = repr(affine[1])
 
     mlmodel.save(str(out_path))
     metadata = {
@@ -152,18 +183,29 @@ def export_ensemble(
     }
     if murmur_threshold is not None:
         metadata["murmur_threshold"] = murmur_threshold
+    if calibration is not None:
+        metadata["calibration"] = {
+            k: calibration[k]
+            for k in ("method", "a", "b", "prior", "oof_nll_before", "oof_nll_after",
+                      "threshold_policy", "raw_threshold")
+        }
     sidecar_metadata_path(out_path).write_text(json.dumps(metadata, indent=2) + "\n")
     log.info("wrote %s", out_path)
     return out_path
 
 
-def verify(checkpoints: list[Path], mlpackage: Path, window_seconds: float = 5.0) -> dict:
+def verify(
+    checkpoints: list[Path],
+    mlpackage: Path,
+    window_seconds: float = 5.0,
+    affine: tuple[float, float] | None = None,
+) -> dict:
     """PyTorch fused-ensemble vs Core ML on the same random input."""
     rng = np.random.default_rng(0)
     n_frames = n_frames_for_window(window_seconds)
     x_np = rng.standard_normal((1, 1, n_frames, N_MELS)).astype(np.float32)
 
-    model = load_members(checkpoints)
+    model = load_members(checkpoints, affine)
     with torch.no_grad():
         y_torch = model(torch.from_numpy(x_np)).numpy()
 
@@ -190,17 +232,32 @@ def main() -> None:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--target", default="iOS17", help=f"deployment target; one of {sorted(TARGETS)}")
     p.add_argument("--window-seconds", type=float, default=5.0)
-    p.add_argument("--murmur-threshold", type=float, default=None)
+    p.add_argument(
+        "--murmur-threshold",
+        type=float,
+        default=None,
+        help="operating threshold; defaults to the calibration record's mapped threshold",
+    )
+    p.add_argument(
+        "--calibration",
+        type=Path,
+        default=None,
+        help="calibrate_ensemble JSON; bakes its a*logit+b map into the exported graph",
+    )
     p.add_argument("--verify", action="store_true", help="torch vs coreml output check")
     args = p.parse_args()
     if len(args.checkpoints) < 2:
         p.error("--checkpoints needs at least two member checkpoints")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    export_ensemble(args.checkpoints, args.out, args.target, args.window_seconds, args.murmur_threshold)
+    calibration = load_calibration(args.calibration)
+    export_ensemble(
+        args.checkpoints, args.out, args.target, args.window_seconds, args.murmur_threshold, calibration,
+    )
     if args.verify:
         log.info("running parity check")
-        print(json.dumps(verify(args.checkpoints, args.out, args.window_seconds), indent=2))
+        affine = None if calibration is None else (float(calibration["a"]), float(calibration["b"]))
+        print(json.dumps(verify(args.checkpoints, args.out, args.window_seconds, affine), indent=2))
 
 
 if __name__ == "__main__":

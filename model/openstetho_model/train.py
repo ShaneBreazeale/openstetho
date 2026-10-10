@@ -14,14 +14,17 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Subset, WeightedRandomSampler
 
+from .calibration import logit as prob_logit
+from .calibration import nll as logit_nll
+from .calibration import prior_shift_offset
 from .dataset import (
     CirCorMurmurDataset,
     CirCorRecordingMurmurDataset,
@@ -37,6 +40,13 @@ from .model import (
     count_parameters,
 )
 from .preprocess import FEATURE_MODES, FEATURE_MODE_LOGMEL, SAMPLE_RATE, feature_channels
+from .recording_mix import (
+    MixedRecordingBatchSampler,
+    SyntheticConfig,
+    SyntheticRecordings,
+    mixed_train_prior,
+    murmur_sources,
+)
 from .thresholds import (
     SPECIFICITY_POLICY_TARGETS,
     specificity_constrained_row,
@@ -47,7 +57,7 @@ from .thresholds import (
 log = logging.getLogger("train")
 LOSS_TYPES = ("bce", "focal_bce", "asymmetric_focal")
 LOSS_LOGIT_CLIP = 30.0
-SELECT_METRICS = ("auc", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target")
+SELECT_METRICS = ("auc", "nll", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target")
 
 
 def build_model(architecture: str, in_channels: int = 1, wide_feature_dim: int = 0) -> nn.Module:
@@ -112,6 +122,31 @@ def add_augmentation_args(p: argparse.ArgumentParser) -> None:
         default=0,
         help="train-only SpecAugment time-mask max width in frames",
     )
+    p.add_argument(
+        "--eq-prob",
+        type=float,
+        default=0.0,
+        help="train-only chance each recording passes through a random smooth EQ (channel sim)",
+    )
+    p.add_argument(
+        "--adpcm-prob",
+        type=float,
+        default=0.0,
+        help="train-only chance each recording passes through the BLE IMA-ADPCM codec",
+    )
+    p.add_argument(
+        "--synth-fraction",
+        type=float,
+        default=0.0,
+        help="recording level: share of every train batch drawn from synthetic recordings "
+        "(murmurs inserted into train-split normals + no-heart signals); 0 disables",
+    )
+    p.add_argument(
+        "--synth-murmur-share",
+        type=float,
+        default=0.5,
+        help="of the synthetic recordings, the fraction with an inserted murmur",
+    )
 
 
 def add_teacher_args(p: argparse.ArgumentParser) -> None:
@@ -151,6 +186,8 @@ def augmentation_config_from_args(args: argparse.Namespace) -> MurmurAugmentatio
         time_shift_prob=args.time_shift_prob,
         freq_mask_max_width=args.freq_mask_max_width,
         time_mask_max_width=args.time_mask_max_width,
+        eq_prob=args.eq_prob,
+        adpcm_prob=args.adpcm_prob,
     )
 
 
@@ -280,6 +317,91 @@ def positive_weighted_sampler(
         replacement=True,
         generator=generator,
     )
+
+
+def recording_train_loader(
+    ds: CirCorRecordingMurmurDataset,
+    train_ds,
+    train_idx: Sequence[int],
+    args: argparse.Namespace,
+    seed: int,
+    pin: bool,
+) -> tuple[DataLoader, float, dict]:
+    """Train loader for recording-level runs.
+
+    `train_ds` is the (possibly augmented) train subset of `ds`; `train_idx`
+    are its indices into `ds`. With `--synth-fraction > 0`, batches mix real
+    recordings with `SyntheticRecordings` built from the train-split
+    Murmur-Absent recordings only. Returns (loader, positive prior the model
+    effectively trains on, metadata for best_meta.json).
+    """
+    real_prior = float(np.mean([ds._records[i][3] for i in train_idx])) if train_idx else float("nan")
+    if args.synth_fraction <= 0.0:
+        sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, seed)
+        loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            num_workers=args.workers,
+            pin_memory=pin,
+            drop_last=True,
+            collate_fn=recording_collate,
+        )
+        return loader, real_prior, {}
+    if args.positive_sample_weight > 1.0:
+        raise ValueError("--synth-fraction cannot be combined with --positive-sample-weight")
+    if ds.include_wide_features or ds.teacher_targets is not None:
+        raise ValueError("synthetic recordings carry no wide features or teacher targets")
+    if ds.apply_cardiac_filter:
+        raise ValueError("synthetic recordings are raw audio; use --no-cardiac")
+
+    normals = sorted({ds._records[i][2] for i in train_idx if ds._records[i][3] == 0})
+    sources = murmur_sources(normals, ds.window_samples) if args.synth_murmur_share > 0 else []
+    cfg = SyntheticConfig(
+        murmur_share=args.synth_murmur_share,
+        eq_prob=args.eq_prob,
+        adpcm_prob=args.adpcm_prob,
+        seed=seed,
+    )
+    synth = SyntheticRecordings(
+        sources,
+        cfg,
+        window_samples=ds.window_samples,
+        hop_samples=ds.hop_samples,
+        feature_mode=ds.feature_mode,
+    )
+    sampler = MixedRecordingBatchSampler(
+        n_real=len(train_ds),
+        n_synth=len(synth),
+        batch_size=args.batch_size,
+        synth_fraction=args.synth_fraction,
+        seed=seed,
+    )
+    log.info(
+        "synthetic mix: %d/%d per batch (murmur share %.2f) from %d train-split normal recordings",
+        sampler.k_synth,
+        args.batch_size,
+        cfg.murmur_share,
+        len(sources),
+    )
+    loader = DataLoader(
+        ConcatDataset([train_ds, synth]),
+        batch_sampler=sampler,
+        num_workers=args.workers,
+        pin_memory=pin,
+        collate_fn=recording_collate,
+    )
+    meta = {
+        "synthetic": {
+            "synth_fraction": args.synth_fraction,
+            "synthetic_share": sampler.synthetic_share,
+            "murmur_share": cfg.murmur_share,
+            "snr_db": list(cfg.snr_db),
+            "murmur_sources": len(sources),
+        },
+    }
+    return loader, mixed_train_prior(real_prior, sampler.synthetic_share, cfg.murmur_share), meta
 
 
 def device(preferred: str = "auto") -> torch.device:
@@ -441,8 +563,13 @@ def run_epoch(
     labels: list[float] = []
     for mel, label in loader:
         batch_labels = [int(round(x)) for x in label.numpy().tolist()]
-        mel = mel.to(dev, non_blocking=True)
-        label = label.to(dev, non_blocking=True).float()
+        # Synchronous copies on purpose. With non_blocking=True, rebinding
+        # `mel` / `label` drops the only reference to the CPU batch while the
+        # async copy is still in flight; on MPS the freed buffer can be reused
+        # and labels arrive as garbage (loss ~1e13). The recording-level path
+        # is safe because its caller keeps `batch` alive for the whole step.
+        mel = mel.to(dev)
+        label = label.to(dev).float()
         with torch.set_grad_enabled(opt is not None):
             logit = model(mel)
             loss = loss_fn(logit, label)
@@ -528,7 +655,7 @@ def predict_windows(
     labels: list[int] = []
     with torch.no_grad():
         for mel, label in loader:
-            mel = mel.to(dev, non_blocking=True)
+            mel = mel.to(dev)  # synchronous: see run_epoch
             logit = model(mel)
             probs.extend(torch.sigmoid(logit).detach().cpu().numpy().tolist())
             labels.extend(int(round(x)) for x in label.numpy().tolist())
@@ -566,7 +693,20 @@ def validation_selection(
     probs: np.ndarray,
     metric: str,
     specificity_target: float = 0.95,
+    logit_offset: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
+    """Higher-is-better validation score plus the row that produced it.
+
+    `nll` scores mean BCE of the logits shifted by `logit_offset` (see
+    `calibration.prior_shift_offset`: undoes pos_weight and any train/val
+    prior gap), negated so that larger is better. It is a smooth, proper
+    score, so it picks checkpoints whose probabilities are honest rather than
+    whichever epoch happened to top a noisy ranking or threshold metric.
+    """
+    if metric == "nll":
+        z = np.asarray(prob_logit(np.asarray(probs, dtype=np.float64)), dtype=np.float64)
+        value = logit_nll(z + logit_offset, labels)
+        return -value, {"nll": value, "logit_offset": logit_offset}
     rows = sweep_thresholds(labels, probs)
     if metric == "f1":
         row = threshold_policy_row(rows, "best_f1")
@@ -758,19 +898,12 @@ def main():
         log.info("train-only augmentation: %s", augmentation)
 
     pin = dev.type in ("cuda",)
-    sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed)
-    shuffle_train = sampler is None
+    synth_meta: dict = {}
     if args.level == "recording":
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=shuffle_train,
-            sampler=sampler,
-            num_workers=args.workers,
-            pin_memory=pin,
-            drop_last=True,
-            collate_fn=recording_collate,
+        train_loader, train_prior, synth_meta = recording_train_loader(
+            ds, train_ds, list(train_ds.indices), args, args.seed, pin
         )
+        val_prior = float(np.mean([ds._records[i][3] for i in val_ds.indices]))
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size,
@@ -780,8 +913,13 @@ def main():
             collate_fn=recording_collate,
         )
     else:
+        if args.synth_fraction > 0.0:
+            p.error("--synth-fraction requires --level recording")
+        sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed)
+        train_prior = float(np.mean([ds._index[i][3] for i in train_ds.indices]))
+        val_prior = float(np.mean([ds._index[i][3] for i in val_ds.indices]))
         train_loader = DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=shuffle_train, sampler=sampler,
+            train_ds, batch_size=args.batch_size, shuffle=sampler is None, sampler=sampler,
             num_workers=args.workers, pin_memory=pin, drop_last=True,
         )
         val_loader = DataLoader(
@@ -804,6 +942,10 @@ def main():
         args.positive_sample_weight,
     )
     pos_weight = torch.tensor([pos_weight_val], device=dev)
+    # Logit shift that undoes pos_weight and the train/val prior gap; used to
+    # score val NLL on the natural validation distribution.
+    val_logit_offset = prior_shift_offset(pos_weight_val, train_prior, val_prior)
+    log.info("train prior %.4f val prior %.4f -> val logit offset %+.4f", train_prior, val_prior, val_logit_offset)
     loss_fn = build_loss_fn(
         args.loss,
         pos_weight,
@@ -864,6 +1006,7 @@ def main():
                 va_probs,
                 args.select_metric,
                 args.select_specificity_target,
+                logit_offset=val_logit_offset,
             )
         lr_now = float(opt.param_groups[0]["lr"])
         history.append({
@@ -943,6 +1086,10 @@ def main():
                 "teacher_topk": args.teacher_topk,
                 "teacher_distill_weight": args.teacher_distill_weight,
                 "augmentation": augmentation.__dict__,
+                "train_prior": train_prior,
+                "val_prior": val_prior,
+                "val_logit_offset": val_logit_offset,
+                **synth_meta,
                 "aggregation": args.aggregation if args.level == "recording" else None,
                 "topk": args.topk if args.level == "recording" else None,
             }))

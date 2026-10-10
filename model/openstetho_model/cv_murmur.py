@@ -36,12 +36,14 @@ from .train import (
     build_loss_fn,
     build_model,
     device,
-    positive_weighted_sampler,
     recording_batch_logits,
     recording_collate,
+    recording_train_loader,
     run_recording_epoch,
     unpack_recording_batch,
+    validation_selection,
 )
+from .calibration import prior_shift_offset
 
 log = logging.getLogger("cv_murmur")
 PROB_EPS = 1e-6
@@ -108,6 +110,8 @@ def train_fold(
 ) -> dict[str, object]:
     fold_dir = args.out / f"fold_{fold:02d}"
     fold_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume and (fold_dir / "best_meta.json").exists() and (fold_dir / "best.pt").exists():
+        return resume_fold(args, ds, fold, fold_dir, train_idx, val_idx, dev)
     torch.manual_seed(args.seed + fold)
 
     train_ds = Subset(ds, train_idx)
@@ -117,16 +121,8 @@ def train_fold(
     train_ds = apply_train_augmentation(train_ds, train_augmentation, args.seed + fold)
     val_ds = Subset(ds, val_idx)
     pin = dev.type in ("cuda",)
-    sampler = positive_weighted_sampler(train_ds, args.positive_sample_weight, args.seed + fold)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
-        num_workers=args.workers,
-        pin_memory=pin,
-        drop_last=True,
-        collate_fn=recording_collate,
+    train_loader, train_prior, synth_meta = recording_train_loader(
+        ds, train_ds, train_idx, args, args.seed + fold, pin
     )
     val_loader = DataLoader(
         val_ds,
@@ -143,6 +139,8 @@ def train_fold(
     bal = subset_balance(ds, train_idx)
     pos_weight_val = max(1.0, bal["absent"] / max(bal["present"], 1)) * args.pos_weight_multiplier
     pos_weight = torch.tensor([pos_weight_val], device=dev)
+    val_prior = subset_balance(ds, val_idx)["present"] / max(len(val_idx), 1)
+    val_logit_offset = prior_shift_offset(pos_weight_val, train_prior, val_prior)
     loss_fn = build_loss_fn(
         args.loss,
         pos_weight,
@@ -187,7 +185,11 @@ def train_fold(
             va_labels = np.asarray([label for label, _prob in va_predictions], dtype=np.int64)
             va_probs = np.asarray([prob for _label, prob in va_predictions], dtype=np.float64)
             va_metrics = summarize(va_labels, va_probs, args.threshold)
-            if args.select_metric == "f1":
+            if args.select_metric == "nll":
+                va_select, _row = validation_selection(
+                    va_labels, va_probs, "nll", logit_offset=val_logit_offset
+                )
+            elif args.select_metric == "f1":
                 va_select = float(va_metrics["best_f1"]["f1"])  # type: ignore[index]
             elif args.select_metric == "youden_j":
                 va_select = float(va_metrics["best_youden_j"]["youden_j"])  # type: ignore[index]
@@ -300,6 +302,10 @@ def train_fold(
         "teacher_topk": args.teacher_topk,
         "teacher_distill_weight": args.teacher_distill_weight,
         "augmentation": train_augmentation.__dict__,
+        "train_prior": train_prior,
+        "val_prior": val_prior,
+        "val_logit_offset": val_logit_offset,
+        **synth_meta,
         "params": count_parameters(model),
     }
     (fold_dir / "best_meta.json").write_text(json.dumps(json_safe(meta), indent=2))
@@ -308,6 +314,39 @@ def train_fold(
     model.eval()
     predictions = predict_recordings(model, val_loader, dev, args.aggregation, args.topk)
     return {**meta, "predictions": predictions}
+
+
+def resume_fold(
+    args: argparse.Namespace,
+    ds: CirCorRecordingMurmurDataset,
+    fold: int,
+    fold_dir: Path,
+    train_idx: list[int],
+    val_idx: list[int],
+    dev: torch.device,
+) -> dict[str, object]:
+    """Reuse a fold that finished in an interrupted run: reload its selected
+    checkpoint and re-score its validation patients. `best_meta.json` is only
+    written once a fold completes, so a half-trained fold is retrained."""
+    meta = json.loads((fold_dir / "best_meta.json").read_text())
+    if meta.get("val_recordings") != len(val_idx):
+        raise ValueError(f"fold {fold}: saved split does not match this run (check --seed/--folds)")
+    if args.wide_features:
+        ds.fit_wide_normalization(train_idx)
+    channels = feature_channels(args.feature_mode)
+    wide_feature_dim = ds.wide_feature_dim if args.wide_features else 0
+    model = build_model(args.architecture, in_channels=channels, wide_feature_dim=wide_feature_dim).to(dev)
+    model.load_state_dict(torch.load(fold_dir / "best.pt", map_location=dev, weights_only=True))
+    model.train(False)
+    val_loader = DataLoader(
+        Subset(ds, val_idx),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        collate_fn=recording_collate,
+    )
+    log.info("fold %02d resumed from %s (best epoch %s)", fold, fold_dir, meta.get("best_epoch"))
+    return {**meta, "predictions": predict_recordings(model, val_loader, dev, args.aggregation, args.topk)}
 
 
 def predict_recordings(
@@ -641,6 +680,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if teacher_targets is not None
         else None,
         "augmentation": augmentation_config_from_args(args).__dict__,
+        "synth_fraction": args.synth_fraction,
+        "synth_murmur_share": args.synth_murmur_share,
         "n_recordings": int(labels.size),
         "positives": int(labels.sum()),
         "fold_reports": fold_reports,
@@ -675,6 +716,11 @@ def main() -> None:
         help="optional stratified patient subset for smoke runs; unset uses all patients",
     )
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse folds in --out that already finished (best_meta.json present); retrain the rest",
+    )
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -705,7 +751,7 @@ def main() -> None:
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument(
         "--select-metric",
-        choices=["auc", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target"],
+        choices=["auc", "nll", "f1", "youden_j", *SPECIFICITY_POLICY_TARGETS.keys(), "specificity_target"],
         default="auc",
     )
     p.add_argument("--select-specificity-target", type=float, default=0.95)

@@ -81,8 +81,7 @@ impl AdpcmDecoder {
         self.predictor as i16
     }
 
-    /// Decode a single 17-byte ADPCM sub-packet (matches
-    /// `Core2ADPCMManager.getPacketLength() = 17`):
+    /// Decode a single 17-byte ADPCM sub-packet, as observed on the wire:
     ///
     ///   * byte 0 — header:
     ///       - bit 7 (`0x80`) set ⇒ codec-reset marker; decoder state
