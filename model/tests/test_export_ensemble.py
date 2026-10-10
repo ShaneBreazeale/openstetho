@@ -44,3 +44,11 @@ def test_single_member_is_identity_in_prob_space():
     ensemble = ProbMeanEnsemble([_ConstLogit(1.3)])
     out = ensemble(torch.zeros(2, 1, 8, 4))
     assert torch.allclose(torch.sigmoid(out), torch.sigmoid(torch.tensor(1.3)), atol=1e-6)
+
+
+def test_affine_recalibration_is_applied_after_the_probability_mean():
+    members = [_ConstLogit(0.5), _ConstLogit(-1.5)]
+    x = torch.zeros(1, 1, 8, 4)
+    raw = ProbMeanEnsemble(members)(x)
+    calibrated = ProbMeanEnsemble(members, affine=(0.8, -0.3))(x)
+    assert torch.allclose(calibrated, raw * 0.8 - 0.3, atol=1e-6)

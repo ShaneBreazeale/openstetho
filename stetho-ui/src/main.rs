@@ -18,7 +18,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stetho_core::dsp::mel::{LogMelSpectrogram, N_MELS};
+use stetho_core::dsp::level::{WindowRms, SILENCE_DBFS};
+use stetho_core::dsp::mel::{LogMelSpectrogram, HOP, N_MELS};
 use stetho_core::dsp::presets::{EqPreset, FilterChain};
 use stetho_core::{AdpcmDecoder, AUDIO_SAMPLE_RATE_HZ};
 use tracing::{error, info};
@@ -86,6 +87,9 @@ enum Msg {
     Samples(Vec<i16>),
     MelFrame([f32; N_MELS]),
     MurmurProb(f32),
+    /// The audio behind the latest murmur window was below SILENCE_DBFS, so
+    /// its score was dropped instead of entering the session aggregate.
+    NoSignal,
     S3Prob(f32),
     ModelDownloadFinished(Result<PathBuf, String>),
 }
@@ -121,6 +125,7 @@ struct App {
     gain_db: f32,
     show_spec: bool,
     murmur_prob: Option<f32>,
+    no_signal: bool,
     murmur_history: Vec<f32>,
     murmur_config: MurmurDecisionConfig,
     s3_prob: Option<f32>,
@@ -152,6 +157,7 @@ impl App {
             gain_db: 0.0,
             show_spec: true,
             murmur_prob: None,
+            no_signal: false,
             murmur_history: Vec::new(),
             murmur_config: murmur_decision_config(model_path.as_ref()),
             s3_prob: None,
@@ -164,6 +170,7 @@ impl App {
 
     fn reset_murmur_aggregation(&mut self) {
         self.murmur_prob = None;
+        self.no_signal = false;
         self.murmur_history.clear();
     }
 
@@ -229,9 +236,11 @@ impl App {
                     self.spec.push(f);
                 }
                 Ok(Msg::MurmurProb(p)) => {
+                    self.no_signal = false;
                     self.murmur_prob = Some(p);
                     self.murmur_history.push(p);
                 }
+                Ok(Msg::NoSignal) => self.no_signal = true,
                 Ok(Msg::S3Prob(p)) => {
                     self.s3_prob = Some(p);
                     if self.s3_history.len() == 60 {
@@ -319,16 +328,22 @@ impl eframe::App for App {
                     } else {
                         egui::Color32::from_rgb(80, 180, 80)
                     };
-                    let latest = self.murmur_prob.unwrap_or(p);
+                    let latest = if self.no_signal {
+                        "no signal".to_string()
+                    } else {
+                        format!("{:.0}%", self.murmur_prob.unwrap_or(p) * 100.0)
+                    };
                     ui.colored_label(
                         color,
                         format!(
-                            "murmur {}: {:.0}% latest {:.0}%",
+                            "murmur {}: {:.0}% latest {latest}",
                             self.murmur_config.aggregation.label(),
                             p * 100.0,
-                            latest * 100.0
                         ),
                     );
+                } else if self.no_signal {
+                    ui.separator();
+                    ui.weak("murmur: no signal");
                 }
                 if let Some(p) = self.s3_prob {
                     ui.separator();
@@ -782,6 +797,7 @@ async fn stream_session(
         p
     };
     let mut engine: Option<MurmurEngine> = load_current_model(initial_murmur_path.as_ref());
+    let mut level = murmur_level_meter(engine.as_ref());
     let mut s3_engine_pair: Option<(S3Engine, PathBuf)> =
         load_s3_model(initial_murmur_path.as_ref());
 
@@ -801,6 +817,7 @@ async fn stream_session(
                 if cfg.model_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     let path = cfg.model_path.lock().unwrap().clone();
                     engine = load_current_model(path.as_ref());
+                    level = murmur_level_meter(engine.as_ref());
                     s3_engine_pair = load_s3_model(path.as_ref());
                 }
 
@@ -814,6 +831,7 @@ async fn stream_session(
 
                 samples_buf.clear();
                 decoder.decode_packet(&notif.value, &mut samples_buf);
+                level.push(&samples_buf);
 
                 // Raw f32 buffer — what the model sees. Training pipeline
                 // feeds raw audio straight to mel-spec, so we mirror that.
@@ -852,7 +870,7 @@ async fn stream_session(
                     let _ = tx.send(Msg::MelFrame(display));
                     if let Some(eng) = engine.as_mut() {
                         if let Some(prob) = eng.push_frame(&norm_frame) {
-                            let _ = tx.send(Msg::MurmurProb(prob));
+                            let _ = tx.send(score_or_no_signal(prob, &level));
                         }
                     }
                     if let Some((eng, _)) = s3_engine_pair.as_mut() {
@@ -875,6 +893,23 @@ async fn stream_session(
     // Bound the disconnect; CoreBluetooth can wedge here indefinitely.
     let _ = tokio::time::timeout(Duration::from_secs(2), peripheral.disconnect()).await;
     Ok(())
+}
+
+/// RMS meter over the raw samples behind one murmur-model window.
+fn murmur_level_meter(engine: Option<&MurmurEngine>) -> WindowRms {
+    let frames = engine.map_or(N_FRAMES_MURMUR, |e| e.n_frames());
+    WindowRms::new(frames * HOP)
+}
+
+/// Report a murmur score only when the window that produced it carried
+/// signal. A stalled stream or idle codec decodes to near-zero samples, which
+/// normalise to a mel-spec the model never trained on.
+fn score_or_no_signal(prob: f32, level: &WindowRms) -> Msg {
+    if level.is_silent(SILENCE_DBFS) {
+        Msg::NoSignal
+    } else {
+        Msg::MurmurProb(prob)
+    }
 }
 
 fn main() -> Result<(), eframe::Error> {
@@ -1293,6 +1328,38 @@ fn collect_downloaded_models(root: &std::path::Path, found: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn silent_window_reports_no_signal_instead_of_a_score() {
+        let mut level = murmur_level_meter(None);
+        level.push(&vec![0; N_FRAMES_MURMUR * HOP]);
+        assert!(matches!(score_or_no_signal(0.77, &level), Msg::NoSignal));
+    }
+
+    #[test]
+    fn window_with_signal_passes_the_score_through() {
+        let n = N_FRAMES_MURMUR * HOP;
+        let mut level = murmur_level_meter(None);
+        let tone: Vec<i16> = (0..n).map(|i| (200.0 * (i as f32 * 0.157).sin()) as i16).collect();
+        level.push(&tone);
+        assert!(matches!(score_or_no_signal(0.4, &level), Msg::MurmurProb(p) if p == 0.4));
+    }
+
+    #[test]
+    fn no_signal_keeps_silence_out_of_the_session_aggregate() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let mut app = App::new(rx, tx.clone(), cmd_tx, None, Vec::new());
+        tx.send(Msg::MurmurProb(0.2)).unwrap();
+        tx.send(Msg::NoSignal).unwrap();
+        app.drain();
+        assert!(app.no_signal);
+        assert_eq!(app.murmur_history, vec![0.2]);
+        tx.send(Msg::MurmurProb(0.6)).unwrap();
+        app.drain();
+        assert!(!app.no_signal);
+        assert_eq!(app.murmur_history, vec![0.2, 0.6]);
+    }
     use std::net::TcpListener;
     use std::thread;
 

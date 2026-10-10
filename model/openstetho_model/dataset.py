@@ -32,6 +32,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from .channel import apply_channel
 from .preprocess import (
     FEATURE_MODE_LOGMEL,
     HOP_FRACTION,
@@ -92,11 +93,20 @@ class MurmurAugmentationConfig:
     time_shift_prob: float = 0.0
     freq_mask_max_width: int = 0
     time_mask_max_width: int = 0
+    # Channel simulation (see `channel.apply_channel`), one draw per recording:
+    # a random smooth EQ, then the BLE IMA-ADPCM codec at a random level.
+    eq_prob: float = 0.0
+    adpcm_prob: float = 0.0
+
+    @property
+    def channel_enabled(self) -> bool:
+        return self.eq_prob > 0.0 or self.adpcm_prob > 0.0
 
     @property
     def enabled(self) -> bool:
         return (
-            (self.audio_noise_snr_db is not None and self.audio_noise_prob > 0.0)
+            self.channel_enabled
+            or (self.audio_noise_snr_db is not None and self.audio_noise_prob > 0.0)
             or self.random_crop
             or self.window_jitter_seconds > 0.0
             or (self.time_shift_seconds > 0.0 and self.time_shift_prob > 0.0)
@@ -220,6 +230,7 @@ class CirCorMurmurDataset(Dataset[tuple[torch.Tensor, int]]):
             # scipy.signal.lfilter accepts (b, a, x); pure-FIR has a=[1].
             import scipy.signal as sps
             audio = sps.lfilter(self._profile_fir, [1.0], audio).astype(np.float32)
+        audio = _augment_channel(audio, self.augmentation, self._augment_rng)
         if self.apply_cardiac_filter:
             audio = apply_cardiac(audio)
         window = _window_at_index(
@@ -334,11 +345,13 @@ class CirCorRecordingMurmurDataset(Dataset[RecordingItem]):
     def wide_feature_dim(self) -> int:
         return len(self.wide_feature_names)
 
-    def _load_recording_audio(self, wav: Path) -> np.ndarray:
+    def _load_recording_audio(self, wav: Path, channel: bool = False) -> np.ndarray:
         audio = load_audio(str(wav))
         if self._profile_fir is not None:
             import scipy.signal as sps
             audio = sps.lfilter(self._profile_fir, [1.0], audio).astype(np.float32)
+        if channel:
+            audio = _augment_channel(audio, self.augmentation, self._augment_rng)
         if self.apply_cardiac_filter:
             audio = apply_cardiac(audio)
         return audio
@@ -404,7 +417,7 @@ class CirCorRecordingMurmurDataset(Dataset[RecordingItem]):
             if self.cache_features:
                 self._feature_cache[idx] = tensor
             return self._format_item(idx, tensor, label)
-        audio = self._load_recording_audio(wav)
+        audio = self._load_recording_audio(wav, channel=True)
         windows = _recording_windows(
             audio,
             self.window_samples,
@@ -514,6 +527,17 @@ def load_recording_teacher_targets(
             raise ValueError(f"unknown teacher aggregation {aggregation!r}")
         targets[(int(patient_id), str(loc))] = float(np.clip(value, 0.0, 1.0))
     return targets
+
+
+def _augment_channel(
+    audio: np.ndarray,
+    config: MurmurAugmentationConfig,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Whole-recording channel draw: one simulated device per recording."""
+    if not config.channel_enabled:
+        return audio
+    return apply_channel(audio, rng, eq_prob=config.eq_prob, adpcm_prob=config.adpcm_prob)
 
 
 def _augment_audio(
