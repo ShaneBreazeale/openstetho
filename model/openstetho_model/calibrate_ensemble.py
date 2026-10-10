@@ -10,8 +10,10 @@ cross-fitting (`calibration.cross_fit_recalibration`). `export_ensemble
 --calibration` bakes the map into the Core ML graph.
 
 The operating threshold moves with it: the raw OoF best-Youden threshold `t`
-becomes `sigmoid(a*logit(t) + b)`, so the app makes exactly the same decisions
-and only the displayed probability changes.
+becomes `sigmoid(a*logit(t) + b)`, which gives the same decisions on these
+recording-level OoF probabilities. stetho-ui instead averages per-window
+probabilities, and averaging after a non-linear map shifts the mean, so check
+the threshold on that scale before release (see the benchmark doc).
 
 Usage::
 

@@ -1091,15 +1091,35 @@ Not promoted.
 
 `calibrate_ensemble` fits identity / temperature / Platt on an ensemble's OoF
 CSV by patient-grouped cross-fitting and maps the operating threshold through
-the same monotone map, so decisions are unchanged.
-`export_ensemble --calibration` bakes the map into the fused Core ML graph.
-On the released v2 ensemble it picks Platt (`1.195*z - 1.501`). OoF NLL drops
-`0.482 -> 0.335`, the calibration line goes from `1.20/-1.50` to `1.00/0.00`,
-and the best-Youden threshold `0.536` maps to `0.209`. The raw ensemble
-overstates murmur probability (the pos_weight bias is never undone), so the
-next release should ship with this applied. The fit is at recording level and
-the app averages per-window probabilities, the same approximation the current
-threshold already makes.
+the same monotone map. `export_ensemble --calibration` bakes the map into the
+fused Core ML graph. On the v2 ensemble it picks Platt (`1.195*z - 1.501`).
+OoF NLL drops `0.482 -> 0.335` and the calibration line goes from
+`1.20/-1.50` to `1.00/0.00`. The raw ensemble overstates murmur probability
+(the pos_weight bias is never undone).
+
+The mapped threshold (`0.536 -> 0.209`) only preserves decisions at recording
+level. stetho-ui averages per-window probabilities, and averaging after a
+non-linear map shifts the mean. With `0.209`, 9 % of CirCor recordings
+flipped from negative to positive in the app's aggregation (specificity
+`0.645 -> 0.540`). Re-matching the threshold on the app's scale gives `0.258`
+and reproduces v0.4.0 decisions on 95.9 % of recordings: sensitivity
+unchanged at `0.886`, specificity `0.645 -> 0.633` (deploy models, in-sample).
+No threshold reaches 100 %, because the two aggregations rank recordings
+slightly differently.
+
+Released as `v0.4.1-murmur-calibrated` (same weights as v0.4.0, Platt map
+baked in, `murmur_threshold` 0.258, same S3 model):
+
+```bash
+uv run --project model python -m openstetho_model.calibrate_ensemble \
+    --oof runs/murmur_cv_logmel_5s_ensemble_v1/oof_predictions.csv \
+    --out runs/release-ensemble-v2-cal/calibration.json
+uv run --project model python -m openstetho_model.export_ensemble \
+    --checkpoints runs/murmur_deploy_seed{0,1,2}/best.pt --window-seconds 5 \
+    --calibration runs/release-ensemble-v2-cal/calibration.json \
+    --murmur-threshold 0.257657 \
+    --out runs/release-ensemble-v2-cal/MurmurCNN.mlpackage --verify
+```
 
 `stetho-ui` now reports "no signal" instead of a murmur score when the RMS of
 the raw audio behind a model window is below -85 dBFS

@@ -34,7 +34,7 @@ const SPECTROGRAM_FRAMES: usize = 128;
 const MURMUR_RECORDING_MEAN_THRESHOLD: f32 = 0.49331352;
 const DEFAULT_MODEL_DOWNLOAD_URL: &str =
     "https://github.com/ShaneBreazeale/openstetho/releases/latest/download/MurmurCNN.mlpackage.zip";
-const CURRENT_MODEL_RELEASE_LABEL: &str = "v0.4.0-murmur-ensemble";
+const CURRENT_MODEL_RELEASE_LABEL: &str = "v0.4.1-murmur-calibrated";
 const CURRENT_LOCAL_MURMUR_RUN: &str = "release-circor-5s-spec93-top4-v1";
 const CURRENT_LOCAL_S3_RUN: &str = "s3_circor_v10";
 const DEFAULT_EQ_PRESET: EqPreset = EqPreset::Cardiac;
@@ -1439,7 +1439,7 @@ mod tests {
 
         assert_eq!(
             display_label(path).as_deref(),
-            Some("v0.4.0-murmur-ensemble (Murmur + S3)")
+            Some("v0.4.1-murmur-calibrated (Murmur + S3)")
         );
     }
 
